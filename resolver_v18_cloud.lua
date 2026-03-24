@@ -783,6 +783,55 @@ local function update_teammate_list()
     end
 end
 
+-- Get local player SteamID (multiple fallback methods)
+local function get_local_steamid()
+    local lp = entity.get_local_player()
+    if not lp then return nil end
+    
+    -- Method 1: Direct entity.get_steam64
+    local steam64 = entity.get_steam64(lp)
+    if steam64 and steam64 ~= 0 then
+        return steam64
+    end
+    
+    -- Method 2: Get from player resource
+    local resource = entity.get_all("CCSPlayerResource")[1]
+    if resource then
+        local local_index = client.userid_to_index and client.userid_to_index() or -1
+        if local_index >= 0 then
+            steam64 = entity.get_prop(resource, "m_iSteamID." .. local_index)
+            if steam64 and steam64 ~= 0 then
+                return steam64
+            end
+        end
+    end
+    
+    -- Method 3: Try getting from console command
+    if not cloud_state.steamid_retry then
+        cloud_state.steamid_retry = 0
+    end
+    
+    if cloud_state.steamid_retry < 3 then
+        cloud_state.steamid_retry = cloud_state.steamid_retry + 1
+        -- Will retry next tick
+        return nil
+    end
+    
+    -- Method 4: Generate session-based ID as last resort
+    local name = entity.get_player_name(lp) or ""
+    if name ~= "" then
+        -- Create a hash from name and time for uniqueness
+        local hash = 0
+        for i = 1, #name do
+            hash = (hash * 31 + string.byte(name, i)) % 2147483647
+        end
+        hash = hash + math.floor(globals.realtime() * 1000) % 100000
+        return "session_" .. tostring(hash)
+    end
+    
+    return nil
+end
+
 -- Validate report data
 local function validate_report(report)
     if not report then return false, "nil report" end
@@ -1118,27 +1167,6 @@ local function http_post_with_retry(url, payload, callback, retry_count)
         
         callback(true)
     end)
-end
-
--- Initialize cloud resolver
-function cloud_resolver.init()
-    local lp = entity.get_local_player()
-    if not lp then return false end
-    
-    cloud_state.my_steam64 = entity.get_steam64(lp)
-    if not cloud_state.my_steam64 or cloud_state.my_steam64 == 0 then return false end
-    
-    cloud_state.my_steamid = tostring(cloud_state.my_steam64)
-    cloud_state.my_team = entity.get_prop(lp, "m_iTeamNum")
-    cloud_state.initialized = true
-    
-    update_teammate_list()
-    
-    if CLOUD_CONFIG.DEBUG then
-        client.log("[Cloud Resolver v19.0] Initialized: " .. cloud_state.my_steamid)
-    end
-    
-    return true
 end
 
 -- Report data to cloud
