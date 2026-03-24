@@ -2762,7 +2762,6 @@ client.set_event_callback("setup_command", function(cmd)
 end)
 
 client.set_event_callback("aim_fire", function(e)
-    if not ui.get(ui_elements.enabled) then return end
     local ent = e.target
     if not ent then return end
     
@@ -2770,14 +2769,33 @@ client.set_event_callback("aim_fire", function(e)
     data.shots = data.shots + 1
     global_stats.shots = global_stats.shots + 1
     
+    -- Get distance
+    local lp = entity.get_local_player()
+    local dist = 0
+    if lp then
+        local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+        local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+        if lx and ex then
+            dist = vec_distance(lx, ly, lz, ex, ey, ez)
+        end
+    end
+    
     -- Check if backtrack was applied
     if data.backtrack_is_valid and data.best_bt_tick then
         global_stats.backtrack_shots = global_stats.backtrack_shots + 1
+        
+        -- Log FIRE with backtrack info
+        local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
+        client.log(string.format("[FIRE] T:%d | Dist:%.0f | BT:%d%s ticks | Angle:%.1f%s", 
+            ent, dist, data.bt_tick_diff or 0, bt_type, data.last_resolve or 60, data.cloud_used and " [CLOUD]" or ""))
+    else
+        -- Log FIRE without backtrack
+        client.log(string.format("[FIRE] T:%d | Dist:%.0f | No BT | Angle:%.1f%s", 
+            ent, dist, data.last_resolve or 60, data.cloud_used and " [CLOUD]" or ""))
     end
 end)
 
 client.set_event_callback("aim_hit", function(e)
-    if not ui.get(ui_elements.enabled) then return end
     local ent = e.target
     if not ent then return end
     
@@ -2789,12 +2807,28 @@ client.set_event_callback("aim_hit", function(e)
     global_stats.streak_current = global_stats.streak_current + 1
     global_stats.streak_best = math.max(global_stats.streak_best, global_stats.streak_current)
     
+    -- Get hit info
+    local hitgroup = e.hitgroup or 0
+    local damage = e.damage or 0
+    local hitgroup_names = {[0]="?", [1]="HEAD", [2]="CHEST", [3]="STOMACH", [4]="LARM", [5]="RARM", [6]="LLEG", [7]="RLEG"}
+    local hitgroup_name = hitgroup_names[hitgroup] or "?"
+    
+    -- Get distance
+    local lp = entity.get_local_player()
+    local dist = 0
+    if lp then
+        local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+        local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+        if lx and ex then
+            dist = vec_distance(lx, ly, lz, ex, ey, ez)
+        end
+    end
+    
     -- Mark backtrack hit
     if data.backtrack_is_valid and data.best_bt_tick then
         global_stats.backtrack_hits = global_stats.backtrack_hits + 1
         
         -- Mark this tick diff as successful for pattern learning
-        local tick_diff = globals.tickcount() - data.best_bt_tick
         for _, bt in ipairs(data.best_tick_history) do
             if bt.tick_count == data.best_bt_tick then
                 bt.hit = true
@@ -2815,6 +2849,7 @@ client.set_event_callback("aim_hit", function(e)
     -- Reset miss learning
     data.opposite_from_miss = nil
     
+    -- Report to cloud
     if ui.get(ui_elements.cloud_enabled) then
         local steam64 = entity.get_steam64(ent)
         if steam64 and steam64 ~= 0 then
@@ -2822,15 +2857,18 @@ client.set_event_callback("aim_hit", function(e)
         end
     end
     
-    if ui.get(ui_elements.log_hits) then
-        local bt_info = ""
-        if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
-            local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
-            bt_info = string.format(" | BT:%d%s ticks", data.bt_tick_diff, bt_type)
-        end
-        client.log(string.format("[HIT] T:%d | Streak:%d | Angle:%.1f%s%s", 
-            ent, data.consecutive_hits, data.last_resolve, bt_info, data.cloud_used and " [CLOUD]" or ""))
+    -- Build log message
+    local bt_info = ""
+    if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
+        local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
+        bt_info = string.format(" | BT:%d%s ticks", data.bt_tick_diff, bt_type)
     end
+    
+    local cloud_info = data.cloud_used and " [CLOUD]" or ""
+    local name = entity.get_player_name(ent) or "?"
+    
+    client.log(string.format("[HIT] %s | T:%d | %s | DMG:%d | Dist:%.0f | Streak:%d | Angle:%.1f%s%s", 
+        name, ent, hitgroup_name, damage, dist, data.consecutive_hits, data.last_resolve, bt_info, cloud_info))
     
     data.backtrack_is_valid = false
     data.best_bt_tick = 0
@@ -2839,12 +2877,18 @@ client.set_event_callback("aim_hit", function(e)
 end)
 
 client.set_event_callback("aim_miss", function(e)
-    if not ui.get(ui_elements.enabled) then return end
     local ent = e.target
     if not ent then return end
     
-    local reason = e.reason or ""
-    if reason ~= "prediction error" and reason ~= "resolver" then return end
+    local reason = e.reason or "unknown"
+    
+    -- Only process resolver-related misses
+    if reason ~= "prediction error" and reason ~= "resolver" then 
+        -- Still log non-resolver misses
+        local name = entity.get_player_name(ent) or "?"
+        client.log(string.format("[MISS] %s | T:%d | Reason: %s (non-resolver)", name, ent, reason))
+        return 
+    end
     
     local data = get_data(ent)
     data.misses = data.misses + 1
@@ -2853,9 +2897,21 @@ client.set_event_callback("aim_miss", function(e)
     global_stats.misses = global_stats.misses + 1
     global_stats.streak_current = 0
     
+    -- Get distance
+    local lp = entity.get_local_player()
+    local dist = 0
+    if lp then
+        local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+        local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+        if lx and ex then
+            dist = vec_distance(lx, ly, lz, ex, ey, ez)
+        end
+    end
+    
     -- Learn from miss
     learn_from_miss(data)
     
+    -- Report to cloud
     if ui.get(ui_elements.cloud_enabled) then
         local steam64 = entity.get_steam64(ent)
         if steam64 and steam64 ~= 0 then
@@ -2863,9 +2919,18 @@ client.set_event_callback("aim_miss", function(e)
         end
     end
     
-    if ui.get(ui_elements.log_hits) then
-        client.log(string.format("[MISS] T:%d | %s | Angle:%.1f", ent, reason, data.last_resolve))
+    -- Build log message
+    local bt_info = ""
+    if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
+        local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
+        bt_info = string.format(" | BT:%d%s", data.bt_tick_diff, bt_type)
     end
+    
+    local cloud_info = data.cloud_used and " [CLOUD]" or ""
+    local name = entity.get_player_name(ent) or "?"
+    
+    client.log(string.format("[MISS] %s | T:%d | %s | Dist:%.0f | Angle:%.1f%s%s", 
+        name, ent, reason, dist, data.last_resolve, bt_info, cloud_info))
     
     data.backtrack_is_valid = false
     data.best_bt_tick = 0
