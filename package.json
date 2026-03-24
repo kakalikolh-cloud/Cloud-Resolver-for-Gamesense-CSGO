@@ -1,0 +1,17 @@
+{
+  "name": "cloud-resolver",
+  "version": "1.0.0",
+  "description": "Cloud Resolver Server for Gamesense CSGO",
+  "main": "cloud_resolver_server.js",
+  "scripts": {
+    "start": "node cloud_resolver_server.js"
+  },
+  "keywords": [
+    "gamesense",
+    "resolver",
+    "csgo",
+    "cloud"
+  ],
+  "author": "Super Z",
+  "license": "MIT"
+}

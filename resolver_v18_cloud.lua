@@ -1,0 +1,2454 @@
+--[[
+    FORWARD HVH RESOLVER v18.0 - CLOUD SYNC
+    Professional resolver with cloud-based data sharing between teammates
+    
+    v18 Features:
+    - Cloud data synchronization between teammates
+    - Hit/Miss data sharing in real-time
+    - Collective resolver learning
+    - Automatic angle propagation
+    - SteamID-based player identification
+    - All v17 features (Backtrack, Interpolation, Extrapolation)
+    
+    by Super Z
+]]
+
+-- ============== CLOUD RESOLVER MODULE ==============
+
+local cloud_resolver = {}
+
+-- Cloud Configuration
+local CLOUD_CONFIG = {
+    -- Set your server URL here
+    SERVER_URL = "http://localhost:3000/api",
+    -- Or use a public server (you need to host this)
+    -- SERVER_URL = "https://your-domain.com/api",
+    
+    POLL_INTERVAL = 2.0,        -- Seconds between data fetch
+    DATA_TIMEOUT = 60.0,        -- Seconds before data expires
+    MIN_CONFIDENCE = 0.5,       -- Minimum confidence to use cloud data
+    SYNC_ON_HIT = true,         -- Send data on hit
+    SYNC_ON_MISS = true,        -- Send data on miss
+    DEBUG = true                -- Debug output
+}
+
+-- Cloud State
+local cloud_state = {
+    initialized = false,
+    my_steamid = nil,
+    my_steam64 = nil,
+    last_poll = 0,
+    cloud_data = {},            -- [steam64] = {angle, confidence, timestamp, reporter}
+    pending_requests = 0,
+    last_sync = 0,
+    sync_count = 0,
+    error_count = 0,
+    last_error = nil
+}
+
+-- JSON Parser (Simple implementation for Gamesense)
+local json = {}
+
+function json.parse(str)
+    if type(str) ~= "string" then return nil end
+    
+    local function skip_whitespace(s, i)
+        while i <= #s and (s:sub(i,i) == " " or s:sub(i,i) == "\t" or 
+                           s:sub(i,i) == "\n" or s:sub(i,i) == "\r") do
+            i = i + 1
+        end
+        return i
+    end
+    
+    local function parse_value(s, i)
+        i = skip_whitespace(s, i)
+        
+        if i > #s then return nil, i end
+        
+        local c = s:sub(i,i)
+        
+        -- Null
+        if s:sub(i, i+3) == "null" then
+            return nil, i + 4
+        end
+        
+        -- Boolean
+        if s:sub(i, i+3) == "true" then
+            return true, i + 4
+        end
+        if s:sub(i, i+4) == "false" then
+            return false, i + 5
+        end
+        
+        -- Number
+        if c == "-" or (c >= "0" and c <= "9") then
+            local j = i
+            if c == "-" then j = j + 1 end
+            while j <= #s and ((s:sub(j,j) >= "0" and s:sub(j,j) <= "9") or 
+                               s:sub(j,j) == "." or s:sub(j,j) == "e" or 
+                               s:sub(j,j) == "E" or s:sub(j,j) == "+" or 
+                               s:sub(j,j) == "-") do
+                j = j + 1
+            end
+            return tonumber(s:sub(i, j-1)), j
+        end
+        
+        -- String
+        if c == '"' then
+            local j = i + 1
+            local result = ""
+            while j <= #s do
+                if s:sub(j,j) == '"' then
+                    return result, j + 1
+                elseif s:sub(j,j) == "\\" and j < #s then
+                    local next = s:sub(j+1, j+1)
+                    if next == "n" then result = result .. "\n"
+                    elseif next == "t" then result = result .. "\t"
+                    elseif next == "r" then result = result .. "\r"
+                    elseif next == '"' then result = result .. '"'
+                    elseif next == "\\" then result = result .. "\\"
+                    else result = result .. next end
+                    j = j + 2
+                else
+                    result = result .. s:sub(j,j)
+                    j = j + 1
+                end
+            end
+            return result, j
+        end
+        
+        -- Array
+        if c == "[" then
+            local arr = {}
+            i = i + 1
+            i = skip_whitespace(s, i)
+            if s:sub(i,i) == "]" then return arr, i + 1 end
+            while i <= #s do
+                local val
+                val, i = parse_value(s, i)
+                table.insert(arr, val)
+                i = skip_whitespace(s, i)
+                if s:sub(i,i) == "]" then return arr, i + 1 end
+                if s:sub(i,i) == "," then i = i + 1 end
+            end
+            return arr, i
+        end
+        
+        -- Object
+        if c == "{" then
+            local obj = {}
+            i = i + 1
+            i = skip_whitespace(s, i)
+            if s:sub(i,i) == "}" then return obj, i + 1 end
+            while i <= #s do
+                local key, val
+                key, i = parse_value(s, i)
+                i = skip_whitespace(s, i)
+                if s:sub(i,i) == ":" then i = i + 1 end
+                i = skip_whitespace(s, i)
+                val, i = parse_value(s, i)
+                obj[key] = val
+                i = skip_whitespace(s, i)
+                if s:sub(i,i) == "}" then return obj, i + 1 end
+                if s:sub(i,i) == "," then i = i + 1 end
+            end
+            return obj, i
+        end
+        
+        return nil, i
+    end
+    
+    local success, result = pcall(function()
+        local val, _ = parse_value(str, 1)
+        return val
+    end)
+    
+    return success and result or nil
+end
+
+function json.encode(val)
+    local t = type(val)
+    
+    if val == nil then return "null"
+    elseif t == "boolean" then return val and "true" or "false"
+    elseif t == "number" then
+        if val ~= val then return "null" end  -- NaN
+        if val == math.huge or val == -math.huge then return "null" end
+        return tostring(val)
+    elseif t == "string" then
+        local escaped = val:gsub('[%z\1-\31\\"]', function(c)
+            return string.format("\\u%04x", c:byte())
+        end)
+        escaped = escaped:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+        return '"' .. escaped .. '"'
+    elseif t == "table" then
+        -- Check if array
+        local is_array = true
+        local count = 0
+        for _ in pairs(val) do count = count + 1 end
+        for i = 1, count do
+            if val[i] == nil then is_array = false break end
+        end
+        
+        if is_array then
+            local parts = {}
+            for _, v in ipairs(val) do
+                table.insert(parts, json.encode(v))
+            end
+            return "[" .. table.concat(parts, ",") .. "]"
+        else
+            local parts = {}
+            for k, v in pairs(val) do
+                table.insert(parts, json.encode(tostring(k)) .. ":" .. json.encode(v))
+            end
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+    end
+    
+    return "null"
+end
+
+-- Initialize cloud resolver
+function cloud_resolver.init()
+    local lp = entity.get_local_player()
+    if not lp then 
+        if CLOUD_CONFIG.DEBUG then
+            client.log("[Cloud Resolver] Waiting for local player...")
+        end
+        return false
+    end
+    
+    cloud_state.my_steam64 = entity.get_steam64(lp)
+    if not cloud_state.my_steam64 or cloud_state.my_steam64 == 0 then
+        if CLOUD_CONFIG.DEBUG then
+            client.log("[Cloud Resolver] Cannot get Steam64, retrying...")
+        end
+        return false
+    end
+    
+    cloud_state.my_steamid = tostring(cloud_state.my_steam64)
+    cloud_state.initialized = true
+    
+    if CLOUD_CONFIG.DEBUG then
+        client.log("[Cloud Resolver] Initialized with SteamID: " .. cloud_state.my_steamid)
+    end
+    
+    return true
+end
+
+-- Send data to cloud
+function cloud_resolver.report_data(enemy_steam64, angle, confidence, hit, pattern)
+    if not cloud_state.initialized then
+        if not cloud_resolver.init() then return false end
+    end
+    
+    if not enemy_steam64 or enemy_steam64 == 0 then return false end
+    
+    -- Validate data
+    angle = tonumber(angle) or 60
+    confidence = tonumber(confidence) or 0.5
+    confidence = math.max(0, math.min(1, confidence))
+    
+    local payload = json.encode({
+        reporter_steamid = cloud_state.my_steamid,
+        enemy_steam64 = tostring(enemy_steam64),
+        angle = angle,
+        confidence = confidence,
+        hit = hit or false,
+        pattern = pattern or "unknown",
+        timestamp = globals.realtime()
+    })
+    
+    local url = CLOUD_CONFIG.SERVER_URL .. "/resolver/update"
+    
+    http.post(url, {["Content-Type"] = "application/json"}, payload, function(data, err)
+        if err and err ~= 200 then
+            cloud_state.error_count = cloud_state.error_count + 1
+            cloud_state.last_error = "HTTP " .. tostring(err)
+            if CLOUD_CONFIG.DEBUG then
+                client.log("[Cloud Resolver] Send error: " .. tostring(err))
+            end
+            return
+        end
+        
+        cloud_state.sync_count = cloud_state.sync_count + 1
+        cloud_state.last_sync = globals.realtime()
+        
+        if CLOUD_CONFIG.DEBUG then
+            client.log("[Cloud Resolver] Data sent successfully")
+        end
+    end)
+    
+    return true
+end
+
+-- Request data from cloud
+function cloud_resolver.poll()
+    if not cloud_state.initialized then
+        if not cloud_resolver.init() then return end
+    end
+    
+    local current_time = globals.realtime()
+    if current_time - cloud_state.last_poll < CLOUD_CONFIG.POLL_INTERVAL then
+        return
+    end
+    cloud_state.last_poll = current_time
+    
+    local url = CLOUD_CONFIG.SERVER_URL .. "/resolver/get"
+    
+    http.get(url, function(data, err)
+        if err and err ~= 200 then
+            cloud_state.error_count = cloud_state.error_count + 1
+            cloud_state.last_error = "HTTP " .. tostring(err)
+            return
+        end
+        
+        if not data or data == "" then return end
+        
+        local decoded = json.parse(data)
+        if not decoded then 
+            if CLOUD_CONFIG.DEBUG then
+                client.log("[Cloud Resolver] Failed to parse response")
+            end
+            return 
+        end
+        
+        -- Update cloud data
+        for steam64, entry in pairs(decoded) do
+            if steam64 ~= cloud_state.my_steamid then
+                cloud_state.cloud_data[steam64] = {
+                    angle = entry.angle,
+                    confidence = entry.confidence,
+                    timestamp = entry.timestamp,
+                    reporter = entry.reporter,
+                    pattern = entry.pattern,
+                    hit = entry.hit
+                }
+            end
+        end
+        
+        if CLOUD_CONFIG.DEBUG then
+            local count = 0
+            for _ in pairs(cloud_state.cloud_data) do count = count + 1 end
+            client.log("[Cloud Resolver] Updated data: " .. count .. " players")
+        end
+    end)
+end
+
+-- Get cloud data for enemy
+function cloud_resolver.get_data(enemy)
+    if not cloud_state.initialized then return nil end
+    
+    local steam64 = entity.get_steam64(enemy)
+    if not steam64 or steam64 == 0 then return nil end
+    
+    local steam_str = tostring(steam64)
+    local data = cloud_state.cloud_data[steam_str]
+    
+    if not data then return nil end
+    
+    -- Check data age
+    local age = globals.realtime() - (data.timestamp or 0)
+    if age > CLOUD_CONFIG.DATA_TIMEOUT then
+        cloud_state.cloud_data[steam_str] = nil
+        return nil
+    end
+    
+    -- Don't use our own data
+    if data.reporter == cloud_state.my_steamid then
+        return nil
+    end
+    
+    -- Check confidence
+    if (data.confidence or 0) < CLOUD_CONFIG.MIN_CONFIDENCE then
+        return nil
+    end
+    
+    return {
+        angle = data.angle,
+        confidence = data.confidence,
+        pattern = data.pattern,
+        hit = data.hit,
+        age = age,
+        reporter = data.reporter
+    }
+end
+
+-- Get status for UI
+function cloud_resolver.get_status()
+    return {
+        initialized = cloud_state.initialized,
+        steamid = cloud_state.my_steamid,
+        sync_count = cloud_state.sync_count,
+        error_count = cloud_state.error_count,
+        last_sync = cloud_state.last_sync,
+        last_error = cloud_state.last_error,
+        data_count = #cloud_state.cloud_data
+    }
+end
+
+-- Clean old data
+function cloud_resolver.clean()
+    local current_time = globals.realtime()
+    local cleaned = 0
+    
+    for steam64, data in pairs(cloud_state.cloud_data) do
+        if current_time - (data.timestamp or 0) > CLOUD_CONFIG.DATA_TIMEOUT then
+            cloud_state.cloud_data[steam64] = nil
+            cleaned = cleaned + 1
+        end
+    end
+    
+    if CLOUD_CONFIG.DEBUG and cleaned > 0 then
+        client.log("[Cloud Resolver] Cleaned " .. cleaned .. " expired entries")
+    end
+end
+
+-- ============== MAIN RESOLVER ==============
+
+-- ============== CONFIGURATION ==============
+
+local CONFIG = {
+    MAX_HISTORY = 200,
+    MAX_ANGLES = 100,
+    MAX_VELOCITY = 120,
+    PREDICTION_DECAY = 0.90,
+    CONFIDENCE_THRESHOLD = 0.20,
+    JITTER_THRESHOLD = 18,
+    SPIN_THRESHOLD = 75,
+    EXTENDED_DESYNC_THRESHOLD = 48,
+    DESYNC_MAX = 60,
+    EXTENDED_DESYNC_MAX = 120,
+    POSE_BODY_YAW = 11,
+    POSE_BODY_PITCH = 12,
+    SAMPLE_RATE = 0.012,
+    DT_TIME_THRESHOLD = 0.22,
+    DT_SHOT_THRESHOLD = 2,
+    MEMORY_DECAY_TIME = 45,
+    MIN_SAMPLES_FOR_PREDICT = 3,
+    
+    -- Backtrack Configuration
+    BACKTRACK_MAX_TICKS = 40,
+    BACKTRACK_HISTORY_SIZE = 65,
+    TICK_INTERVAL = 0.015625,
+    
+    -- Interpolation Configuration
+    INTERPOLATION_ENABLED = true,
+    CUBIC_INTERPOLATION = true,
+    CATMULL_ROM_SPLINE = true,
+    INTERPOLATION_STEPS = 4,
+    
+    -- Extrapolation Configuration
+    EXTRAPOLATION_ENABLED = true,
+    MAX_EXTRAPOLATION_TICKS = 8,
+    GRAVITY = 800,
+    AIR_ACCELERATION = 1000,
+    GROUND_FRICTION = 4,
+    STOP_SPEED = 100,
+    VELOCITY_DAMPING = 0.85,
+    ACCELERATION_SMOOTHING = 0.3,
+    
+    -- Prediction Weights
+    WEIGHT_DISTANCE = 1.0,
+    WEIGHT_VELOCITY = 0.85,
+    WEIGHT_LC_BREAK = 2.0,
+    WEIGHT_INTERPOLATED = 1.2,
+    WEIGHT_EXTRAPOLATED = 0.9,
+    WEIGHT_PREDICTION_CONF = 1.1,
+    
+    -- Cloud Resolver Weights
+    CLOUD_WEIGHT = 2.5,         -- High priority for cloud data
+    CLOUD_MIN_CONFIDENCE = 0.5
+}
+
+-- ============== DATA STRUCTURES ==============
+
+local function create_stats()
+    return {
+        shots = 0, hits = 0, misses = 0,
+        resolved = 0, bruteforced = 0,
+        headshots = 0, bodyshots = 0,
+        streak_best = 0, streak_current = 0,
+        prediction_accuracy = 0,
+        extended_hits = 0, spin_hits = 0, jitter_hits = 0,
+        adaptive_hits = 0, memory_hits = 0,
+        total_resolves = 0,
+        backtrack_shots = 0,
+        backtrack_hits = 0,
+        backtrack_ticks_used = 0,
+        backtrack_avg_tick = 0,
+        backtrack_lc_breaks = 0,
+        backtrack_interpolated_hits = 0,
+        backtrack_extrapolated_hits = 0,
+        backtrack_cubic_hits = 0,
+        backtrack_spline_hits = 0,
+        backtrack_air_pred_hits = 0,
+        backtrack_avg_score = 0,
+        backtrack_best_score = 0,
+        interpolation_accuracy = 0,
+        extrapolation_accuracy = 0,
+        cloud_resolves = 0,
+        cloud_hits = 0,
+        cloud_syncs = 0
+    }
+end
+
+local function create_player_data()
+    return {
+        -- History
+        angle_history = {},
+        velocity_history = {},
+        shot_history = {},
+        resolve_history = {},
+        backtrack_records = {},
+        
+        -- State
+        bf_index = 1,
+        bf_stage = 1,
+        bf_angle = 60,
+        predicted_side = 0,
+        predicted_angle = 60,
+        confidence = 0.35,
+        last_resolve = 60,
+        force_angle = 60,
+        best_angle = 60,
+        
+        -- Analysis
+        jitter_score = 0,
+        jitter_amplitude = 0,
+        jitter_phase = 0,
+        spin_speed = 0,
+        spin_direction = 0,
+        spin_variance = 0,
+        desync_amount = 60,
+        extended_desync_amount = 0,
+        bodyyaw_side = 0,
+        freestand_side = 0,
+        avg_angle_change = 0,
+        angle_variance = 0,
+        velocity_variance = 0,
+        
+        -- Pose
+        pose_body_yaw = 0,
+        pose_body_yaw_angle = 0,
+        pose_body_pitch = 0,
+        roll_angle = 0,
+        
+        -- Pattern
+        detected_pattern = "unknown",
+        pattern_confidence = 0,
+        
+        -- Statistics
+        shots = 0,
+        hits = 0,
+        misses = 0,
+        consecutive_hits = 0,
+        consecutive_misses = 0,
+        last_hit_angle = 0,
+        successful_resolves = {},
+        hit_angles = {},
+        miss_angles = {},
+        angle_success_rate = {},
+        
+        -- Learning
+        learned_side = 0,
+        learned_confidence = 0,
+        side_weights = { left = 0, right = 0, center = 0 },
+        pattern_memory = {},
+        best_tick_history = {},
+        
+        -- DT
+        dt_shots = {},
+        dt_detected = false,
+        dt_confidence = 0,
+        dt_angle_offset = 0,
+        dt_predicted_side = 0,
+        dt_firing_speed = 0,
+        last_ammo = -1,
+        
+        -- Backtrack State
+        backtrack_best_tick = 0,
+        backtrack_last_tick = 0,
+        backtrack_sim_time = 0,
+        backtrack_origin = { x = 0, y = 0, z = 0 },
+        backtrack_angles = { pitch = 0, yaw = 0 },
+        backtrack_velocity = { x = 0, y = 0, z = 0 },
+        backtrack_is_valid = false,
+        backtrack_score = 0,
+        backtrack_is_interpolated = false,
+        backtrack_is_extrapolated = false,
+        backtrack_is_cubic = false,
+        backtrack_is_spline = false,
+        backtrack_interp_factor = 0,
+        
+        -- Interpolation & Extrapolation State
+        prev_origin = { x = 0, y = 0, z = 0 },
+        prev_velocity = { x = 0, y = 0, z = 0 },
+        prev_prev_origin = { x = 0, y = 0, z = 0 },
+        prev_prev_velocity = { x = 0, y = 0, z = 0 },
+        acceleration = { x = 0, y = 0, z = 0 },
+        prev_acceleration = { x = 0, y = 0, z = 0 },
+        avg_acceleration = { x = 0, y = 0, z = 0 },
+        velocity_delta = 0,
+        origin_delta = 0,
+        prev_sim_time = 0,
+        
+        -- Ground & Air State
+        is_on_ground = true,
+        was_on_ground = true,
+        ground_entity = -1,
+        fall_velocity = 0,
+        jump_time = 0,
+        
+        -- Movement Prediction
+        predicted_origin = { x = 0, y = 0, z = 0 },
+        predicted_velocity = { x = 0, y = 0, z = 0 },
+        predicted_head_pos = { x = 0, y = 0, z = 0 },
+        extrapolation_confidence = 0,
+        
+        -- Choke Analysis
+        choke_pattern = {},
+        avg_choke = 0,
+        last_choke = 0,
+        is_choking = false,
+        
+        -- LC Break
+        lc_break_detected = false,
+        
+        -- Cloud Resolver State
+        cloud_angle = nil,
+        cloud_confidence = nil,
+        cloud_last_update = 0,
+        cloud_used = false,
+        
+        -- Flags
+        is_jitter = false,
+        is_freestanding = false,
+        is_moving = false,
+        is_resolved = false,
+        is_spinning = false,
+        is_extended = false,
+        is_fakewalking = false,
+        is_micro_moving = false,
+        is_breaking_lc = false,
+        is_scoped = false,
+        is_crouching = false,
+        is_air = false,
+        has_roll = false,
+        
+        -- Timing
+        last_plist_update = 0,
+        last_update = 0,
+        last_shot_time = 0,
+        last_record_time = 0,
+        
+        -- BF State
+        bf_state = {
+            stage = 1,
+            direction = 1,
+            smart_mode = false,
+            last_angles = {},
+            successful_patterns = {}
+        },
+        
+        -- Shot correlation
+        shot_correlation = {
+            total = 0,
+            hit_angles = {},
+            miss_angles = {},
+            best_angle = 60
+        }
+    }
+end
+
+-- ============== UI ==============
+
+local ui_elements = {
+    enabled = ui.new_checkbox("RAGE", "Other", "Enable Resolver"),
+    
+    mode = ui.new_combobox("RAGE", "Other", "Resolver Mode", {
+        "Cloud Priority", 
+        "Adaptive Pro", 
+        "Deep Memory",
+        "Animation+",
+        "Extended+",
+        "Smart BF",
+        "Anti-Everything"
+    }),
+    
+    -- Cloud Resolver UI
+    cloud_label = ui.new_label("RAGE", "Other", "━━━ Cloud Resolver ━━━"),
+    cloud_enabled = ui.new_checkbox("RAGE", "Other", "Enable Cloud Sync"),
+    cloud_url = ui.new_textbox("RAGE", "Other", "Server URL"),
+    cloud_debug = ui.new_checkbox("RAGE", "Other", "Cloud Debug"),
+    cloud_test = ui.new_button("RAGE", "Other", "Test Connection", function()
+        if cloud_state.initialized then
+            client.log("[Cloud Resolver] SteamID: " .. tostring(cloud_state.my_steamid))
+            client.log("[Cloud Resolver] Syncs: " .. cloud_state.sync_count)
+            client.log("[Cloud Resolver] Errors: " .. cloud_state.error_count)
+        else
+            client.log("[Cloud Resolver] Not initialized")
+        end
+    end),
+    
+    bf_label = ui.new_label("RAGE", "Other", "━━━ Bruteforce ━━━"),
+    bf_mode = ui.new_combobox("RAGE", "Other", "BF Strategy", {
+        "Smart Adaptive", 
+        "Multi-Stage Pro",
+        "Memory Based",
+        "Anti-Jitter",
+        "Anti-Spin",
+        "Extended"
+    }),
+    bf_delay = ui.new_slider("RAGE", "Other", "BF Delay", 0, 5, 1, true, "shots"),
+    bf_smart = ui.new_checkbox("RAGE", "Other", "Smart Angle Selection"),
+    
+    method_label = ui.new_label("RAGE", "Other", "━━━ Method ━━━"),
+    resolve_method = ui.new_combobox("RAGE", "Other", "Resolve Method", {
+        "PList Force",
+        "Hybrid (All)"
+    }),
+    
+    -- Backtrack UI
+    bt_label = ui.new_label("RAGE", "Other", "━━━ Backtrack (Always ON) ━━━"),
+    bt_ticks = ui.new_slider("RAGE", "Other", "Max Ticks", 14, 40, 40, true, "ticks"),
+    bt_visualize = ui.new_checkbox("RAGE", "Other", "Visualize History"),
+    
+    -- Interpolation & Extrapolation UI
+    ie_label = ui.new_label("RAGE", "Other", "━━━ Interpolation & Extrapolation ━━━"),
+    ie_interpolation = ui.new_checkbox("RAGE", "Other", "Cubic Interpolation"),
+    ie_spline = ui.new_checkbox("RAGE", "Other", "Catmull-Rom Spline"),
+    ie_extrapolation = ui.new_checkbox("RAGE", "Other", "Physics Extrapolation"),
+    ie_air_pred = ui.new_checkbox("RAGE", "Other", "Air Trajectory Prediction"),
+    ie_subticks = ui.new_slider("RAGE", "Other", "Sub-tick Resolution", 1, 8, 4, true, "steps"),
+    ie_extrapolation_ticks = ui.new_slider("RAGE", "Other", "Max Extrapolation", 1, 12, 6, true, "ticks"),
+    
+    dt_label = ui.new_label("RAGE", "Other", "━━━ Double Tap ━━━"),
+    dt_predict = ui.new_checkbox("RAGE", "Other", "DT Prediction"),
+    dt_aggression = ui.new_slider("RAGE", "Other", "DT Angle Shift", 0, 30, 15, true, "°"),
+    
+    adv_label = ui.new_label("RAGE", "Other", "━━━ Settings ━━━"),
+    aggression = ui.new_slider("RAGE", "Other", "Aggression", 1, 10, 7, true, "lvl"),
+    confidence_min = ui.new_slider("RAGE", "Other", "Min Confidence", 10, 50, 20, true, "%"),
+    
+    override_key = ui.new_hotkey("RAGE", "Other", "Manual Override", true),
+    override_mode = ui.new_combobox("RAGE", "Other", "Override Side", {"Left", "Right", "Auto", "Opposite"}),
+    
+    debug_label = ui.new_label("RAGE", "Other", "━━━ Debug ━━━"),
+    debug_mode = ui.new_checkbox("RAGE", "Other", "Debug Output"),
+    show_stats = ui.new_checkbox("RAGE", "Other", "Show Statistics"),
+    log_hits = ui.new_checkbox("RAGE", "Other", "Log Hits/Misses"),
+    
+    reset_btn = ui.new_button("RAGE", "Other", "Reset All Data", function()
+        player_data = {}
+        global_stats = create_stats()
+        cloud_state.cloud_data = {}
+        client.log("[Resolver v18] Data reset")
+    end)
+}
+
+-- Enable by default
+ui.set(ui_elements.dt_predict, true)
+ui.set(ui_elements.show_stats, true)
+ui.set(ui_elements.bf_smart, true)
+ui.set(ui_elements.ie_interpolation, true)
+ui.set(ui_elements.ie_spline, true)
+ui.set(ui_elements.ie_extrapolation, true)
+ui.set(ui_elements.ie_air_pred, true)
+ui.set(ui_elements.cloud_enabled, true)
+ui.set(ui_elements.cloud_url, "http://localhost:3000/api")
+
+local global_stats = create_stats()
+local player_data = {}
+
+-- ============== CONSTANTS ==============
+
+local SIDES = { LEFT = -1, CENTER = 0, RIGHT = 1 }
+
+local BF_PATTERNS = {
+    Smart_Adaptive = { 
+        { angle = 60, weight = 1.0 }, { angle = -60, weight = 1.0 },
+        { angle = 58, weight = 0.9 }, { angle = -58, weight = 0.9 },
+        { angle = 90, weight = 0.85 }, { angle = -90, weight = 0.85 },
+        { angle = 45, weight = 0.8 }, { angle = -45, weight = 0.8 },
+        { angle = 120, weight = 0.75 }, { angle = -120, weight = 0.75 }
+    },
+    Multi_Stage_Pro = {
+        { 60, -60, 58, -58, 0 },
+        { 90, -90, 75, -75, 105, -105 },
+        { 120, -120, 135, -135, 150, -150 },
+        { 45, -45, 30, -30, 52, -52 },
+        { 165, -165, 150, -150, 175, -175 }
+    },
+    Anti_Jitter = { 58, -58, 62, -62, 55, -55, 65, -65 },
+    Anti_Spin = { 90, -90, 0, 180, 60, -60, 120, -120 },
+    Extended = { 90, -90, 120, -120, 150, -150, 165, -165 }
+}
+
+-- ============== UTILITIES ==============
+
+local function clamp(v, min, max)
+    if type(v) ~= "number" then return min end
+    if v ~= v then return min end
+    return math.max(min, math.min(max, v))
+end
+
+local function normalize_angle(a)
+    if type(a) ~= "number" then return 0 end
+    while a > 180 do a = a - 360 end
+    while a < -180 do a = a + 360 end
+    return a
+end
+
+local function angle_diff(a, b)
+    return normalize_angle((a or 0) - (b or 0))
+end
+
+local function get_data(ent)
+    if not player_data[ent] then
+        player_data[ent] = create_player_data()
+    end
+    return player_data[ent]
+end
+
+local function get_steam64(ent)
+    return entity.get_steam64(ent)
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * clamp(t, 0, 1)
+end
+
+local function vec_length(x, y, z)
+    return math.sqrt((x or 0)^2 + (y or 0)^2 + (z or 0)^2)
+end
+
+local function vec_distance(x1, y1, z1, x2, y2, z2)
+    local dx = (x1 or 0) - (x2 or 0)
+    local dy = (y1 or 0) - (y2 or 0)
+    local dz = (z1 or 0) - (z2 or 0)
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+end
+
+local function vec_length_2d(x, y)
+    return math.sqrt((x or 0)^2 + (y or 0)^2)
+end
+
+local function time_to_ticks(t)
+    return math.floor(t / CONFIG.TICK_INTERVAL + 0.5)
+end
+
+local function ticks_to_time(ticks)
+    return ticks * CONFIG.TICK_INTERVAL
+end
+
+-- ============== ADVANCED INTERPOLATION FUNCTIONS ==============
+
+local function hermite_basis_00(t)
+    return 2*t*t*t - 3*t*t + 1
+end
+
+local function hermite_basis_10(t)
+    return t*t*t - 2*t*t + t
+end
+
+local function hermite_basis_01(t)
+    return -2*t*t*t + 3*t*t
+end
+
+local function hermite_basis_11(t)
+    return t*t*t - t*t
+end
+
+local function cubic_hermite_interp(p0, p1, m0, m1, t)
+    t = clamp(t, 0, 1)
+    return hermite_basis_00(t) * p0 + 
+           hermite_basis_10(t) * m0 + 
+           hermite_basis_01(t) * p1 + 
+           hermite_basis_11(t) * m1
+end
+
+local function catmull_rom_spline(p0, p1, p2, p3, t)
+    t = clamp(t, 0, 1)
+    local t2 = t * t
+    local t3 = t2 * t
+    
+    return 0.5 * (
+        (2 * p1) +
+        (-p0 + p2) * t +
+        (2*p0 - 5*p1 + 4*p2 - p3) * t2 +
+        (-p0 + 3*p1 - 3*p2 + p3) * t3
+    )
+end
+
+local function interpolate_position_cubic(rec1, rec2, t, dt)
+    dt = dt or CONFIG.TICK_INTERVAL
+    
+    local m0x = rec1.velocity.x * dt
+    local m0y = rec1.velocity.y * dt
+    local m0z = rec1.velocity.z * dt
+    
+    local m1x = rec2.velocity.x * dt
+    local m1y = rec2.velocity.y * dt
+    local m1z = rec2.velocity.z * dt
+    
+    return {
+        x = cubic_hermite_interp(rec1.origin.x, rec2.origin.x, m0x, m1x, t),
+        y = cubic_hermite_interp(rec1.origin.y, rec2.origin.y, m0y, m1y, t),
+        z = cubic_hermite_interp(rec1.origin.z, rec2.origin.z, m0z, m1z, t)
+    }
+end
+
+local function interpolate_position_spline(rec_prev, rec0, rec1, rec_next, t)
+    return {
+        x = catmull_rom_spline(rec_prev.origin.x, rec0.origin.x, rec1.origin.x, rec_next.origin.x, t),
+        y = catmull_rom_spline(rec_prev.origin.y, rec0.origin.y, rec1.origin.y, rec_next.origin.y, t),
+        z = catmull_rom_spline(rec_prev.origin.z, rec0.origin.z, rec1.origin.z, rec_next.origin.z, t)
+    }
+end
+
+-- ============== ADVANCED EXTRAPOLATION FUNCTIONS ==============
+
+local function is_on_ground(ent, data)
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    local on_ground = bit.band(flags, 1) ~= 0
+    
+    data.was_on_ground = data.is_on_ground
+    data.is_on_ground = on_ground
+    
+    return on_ground
+end
+
+local function calculate_acceleration(data, vel_x, vel_y, vel_z, dt)
+    dt = dt or CONFIG.TICK_INTERVAL
+    if dt <= 0 then return data.acceleration end
+    
+    local new_acc = {
+        x = (vel_x - data.prev_velocity.x) / dt,
+        y = (vel_y - data.prev_velocity.y) / dt,
+        z = (vel_z - data.prev_velocity.z) / dt
+    }
+    
+    data.prev_acceleration = { x = data.acceleration.x, y = data.acceleration.y, z = data.acceleration.z }
+    data.acceleration = {
+        x = lerp(data.acceleration.x, new_acc.x, CONFIG.ACCELERATION_SMOOTHING),
+        y = lerp(data.acceleration.y, new_acc.y, CONFIG.ACCELERATION_SMOOTHING),
+        z = lerp(data.acceleration.z, new_acc.z, CONFIG.ACCELERATION_SMOOTHING)
+    }
+    
+    data.avg_acceleration = {
+        x = (data.acceleration.x + data.prev_acceleration.x) * 0.5,
+        y = (data.acceleration.y + data.prev_acceleration.y) * 0.5,
+        z = (data.acceleration.z + data.prev_acceleration.z) * 0.5
+    }
+    
+    return data.acceleration
+end
+
+local function extrapolate_ground(origin, velocity, acceleration, ticks, data)
+    local result = { x = origin.x, y = origin.y, z = origin.z }
+    local vel = { x = velocity.x, y = velocity.y, z = velocity.z }
+    local dt = CONFIG.TICK_INTERVAL
+    
+    local friction = CONFIG.GROUND_FRICTION
+    
+    for i = 1, ticks do
+        local speed = vec_length_2d(vel.x, vel.y)
+        if speed > 0 then
+            local drop = speed * friction * dt
+            local new_speed = math.max(speed - drop, 0)
+            local factor = new_speed / speed
+            
+            vel.x = vel.x * factor
+            vel.y = vel.y * factor
+        end
+        
+        if acceleration then
+            vel.x = vel.x + acceleration.x * dt
+            vel.y = vel.y + acceleration.y * dt
+        end
+        
+        local new_speed = vec_length_2d(vel.x, vel.y)
+        if new_speed > 250 then
+            local factor = 250 / new_speed
+            vel.x = vel.x * factor
+            vel.y = vel.y * factor
+        end
+        
+        result.x = result.x + vel.x * dt
+        result.y = result.y + vel.y * dt
+    end
+    
+    return result, vel
+end
+
+local function extrapolate_air(origin, velocity, ticks, duck_amount)
+    local result = { x = origin.x, y = origin.y, z = origin.z }
+    local vel = { x = velocity.x, y = velocity.y, z = velocity.z }
+    local dt = CONFIG.TICK_INTERVAL
+    local gravity = CONFIG.GRAVITY
+    local air_accel = CONFIG.AIR_ACCELERATION
+    
+    local duck_factor = 1.0 - (duck_amount or 0) * 0.2
+    
+    for i = 1, ticks do
+        vel.z = vel.z - gravity * dt * duck_factor
+        vel.z = math.max(vel.z, -350)
+        
+        local wish_speed = 30
+        local current_speed = vec_length_2d(vel.x, vel.y)
+        
+        if current_speed < wish_speed then
+            local accel_dir = { x = vel.x, y = vel.y }
+            local len = vec_length_2d(accel_dir.x, accel_dir.y)
+            if len > 0.1 then
+                accel_dir.x = accel_dir.x / len
+                accel_dir.y = accel_dir.y / len
+                
+                local add_speed = wish_speed - current_speed
+                local accel_speed = math.min(air_accel * dt * wish_speed, add_speed)
+                
+                vel.x = vel.x + accel_dir.x * accel_speed
+                vel.y = vel.y + accel_dir.y * accel_speed
+            end
+        end
+        
+        local air_speed = vec_length_2d(vel.x, vel.y)
+        if air_speed > 30 then
+            local factor = 30 / air_speed
+            vel.x = vel.x * factor
+            vel.y = vel.y * factor
+        end
+        
+        result.x = result.x + vel.x * dt
+        result.y = result.y + vel.y * dt
+        result.z = result.z + vel.z * dt
+    end
+    
+    return result, vel
+end
+
+local function extrapolate_position(origin, velocity, acceleration, ticks, is_grounded, duck)
+    if is_grounded then
+        return extrapolate_ground(origin, velocity, acceleration, ticks)
+    else
+        return extrapolate_air(origin, velocity, ticks, duck)
+    end
+end
+
+local function predict_head_position(origin, velocity, duck, is_grounded, ticks)
+    local head_height = 64
+    
+    local future_duck = duck
+    if velocity.z > 0 and not is_grounded then
+        future_duck = math.max(0, duck - ticks * 0.1)
+    elseif is_grounded then
+        future_duck = duck
+    end
+    
+    if future_duck > 0.5 then
+        head_height = 46
+    else
+        head_height = lerp(64, 46, future_duck)
+    end
+    
+    local dt = ticks * CONFIG.TICK_INTERVAL
+    local future_origin = {
+        x = origin.x + velocity.x * dt,
+        y = origin.y + velocity.y * dt,
+        z = origin.z + velocity.z * dt
+    }
+    
+    return {
+        x = future_origin.x,
+        y = future_origin.y,
+        z = future_origin.z + head_height
+    }
+end
+
+-- ============== PLIST ==============
+
+local function plist_set_force_angle(ent, angle)
+    local steam64 = get_steam64(ent)
+    if not steam64 or steam64 == 0 then return false end
+    plist.set(steam64, "Force bodyyaw", true)
+    plist.set(steam64, "Force bodyyaw value", angle)
+    return true
+end
+
+local function plist_clear_force(ent)
+    local steam64 = get_steam64(ent)
+    if not steam64 or steam64 == 0 then return false end
+    plist.set(steam64, "Force bodyyaw", false)
+    plist.set(steam64, "Force bodyyaw value", 0)
+    return true
+end
+
+-- ============== BACKTRACK RECORDING ==============
+
+local function record_backtrack(ent, data)
+    if not entity.is_alive(ent) then return end
+    
+    local sim_time = entity.get_prop(ent, "m_flSimulationTime")
+    local origin_x, origin_y, origin_z = entity.get_prop(ent, "m_vecOrigin")
+    
+    if not sim_time or not origin_x then return end
+    
+    local vel_x = entity.get_prop(ent, "m_vecVelocity[0]") or 0
+    local vel_y = entity.get_prop(ent, "m_vecVelocity[1]") or 0
+    local vel_z = entity.get_prop(ent, "m_vecVelocity[2]") or 0
+    
+    local eye_offset_z = entity.get_prop(ent, "m_vecViewOffset[2]") or 64
+    local yaw = entity.get_prop(ent, "m_angEyeAngles[1]") or 0
+    local pitch = entity.get_prop(ent, "m_angEyeAngles[0]") or 0
+    
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    local duck = entity.get_prop(ent, "m_flDuckAmount") or 0
+    
+    local speed = vec_length(vel_x, vel_y, vel_z)
+    local current_tick = globals.tickcount()
+    
+    local is_grounded = is_on_ground(ent, data)
+    
+    local dt = sim_time - (data.prev_sim_time or sim_time)
+    if dt <= 0 then dt = CONFIG.TICK_INTERVAL end
+    
+    calculate_acceleration(data, vel_x, vel_y, vel_z, dt)
+    
+    data.velocity_delta = vec_distance(
+        data.prev_velocity.x, data.prev_velocity.y, data.prev_velocity.z,
+        vel_x, vel_y, vel_z
+    )
+    
+    data.origin_delta = vec_distance(
+        data.prev_origin.x, data.prev_origin.y, data.prev_origin.z,
+        origin_x, origin_y, origin_z
+    )
+    
+    data.lc_break_detected = data.origin_delta > 64 or data.velocity_delta > 200
+    
+    local expected_ticks = math.floor(dt / CONFIG.TICK_INTERVAL + 0.5)
+    if expected_ticks > 1 then
+        data.is_choking = true
+        data.last_choke = expected_ticks - 1
+        table.insert(data.choke_pattern, data.last_choke)
+        while #data.choke_pattern > 20 do table.remove(data.choke_pattern, 1) end
+    else
+        data.is_choking = false
+    end
+    
+    local head_z = origin_z + (duck > 0.5 and 46 or 64)
+    
+    local max_extrap = ui.get(ui_elements.ie_extrapolation_ticks)
+    local predicted, pred_vel
+    if ui.get(ui_elements.ie_extrapolation) then
+        predicted, pred_vel = extrapolate_position(
+            { x = origin_x, y = origin_y, z = origin_z },
+            { x = vel_x, y = vel_y, z = vel_z },
+            data.avg_acceleration,
+            max_extrap,
+            is_grounded,
+            duck
+        )
+    else
+        predicted = { x = origin_x, y = origin_y, z = origin_z }
+        pred_vel = { x = vel_x, y = vel_y, z = vel_z }
+    end
+    
+    data.predicted_origin = predicted
+    data.predicted_velocity = pred_vel
+    
+    if ui.get(ui_elements.ie_air_pred) then
+        data.predicted_head_pos = predict_head_position(
+            { x = origin_x, y = origin_y, z = origin_z },
+            { x = vel_x, y = vel_y, z = vel_z },
+            duck, is_grounded, max_extrap
+        )
+    else
+        data.predicted_head_pos = { x = origin_x, y = origin_y, z = head_z }
+    end
+    
+    if #data.velocity_history >= 5 then
+        local var = 0
+        for i = #data.velocity_history - 4, #data.velocity_history do
+            var = var + data.velocity_history[i].speed
+        end
+        var = var / 5
+        local avg_var = 0
+        for i = #data.velocity_history - 4, #data.velocity_history do
+            avg_var = avg_var + (data.velocity_history[i].speed - var)^2
+        end
+        data.extrapolation_confidence = math.max(0.3, 1 - math.sqrt(avg_var / 5) / 100)
+    else
+        data.extrapolation_confidence = 0.5
+    end
+    
+    local record = {
+        sim_time = sim_time,
+        tick_count = time_to_ticks(sim_time),
+        origin = { x = origin_x, y = origin_y, z = origin_z },
+        head_pos = { x = origin_x, y = origin_y, z = head_z },
+        eye_pos = { x = origin_x, y = origin_y, z = origin_z + eye_offset_z },
+        angles = { pitch = pitch, yaw = yaw },
+        velocity = { x = vel_x, y = vel_y, z = vel_z },
+        acceleration = { x = data.acceleration.x, y = data.acceleration.y, z = data.acceleration.z },
+        flags = flags,
+        duck = duck,
+        speed = speed,
+        time = globals.realtime(),
+        is_grounded = is_grounded,
+        body_yaw = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_YAW),
+        is_lc_break = data.lc_break_detected,
+        velocity_delta = data.velocity_delta,
+        origin_delta = data.origin_delta,
+        is_choking = data.is_choking,
+        choke_amount = data.last_choke,
+        predicted_origin = predicted,
+        predicted_velocity = pred_vel,
+        predicted_head = data.predicted_head_pos,
+        extrapolation_confidence = data.extrapolation_confidence,
+        predicted_side = data.predicted_side,
+        resolve_angle = data.last_resolve,
+        confidence = data.confidence,
+        valid = true,
+        score = 0
+    }
+    
+    while #data.backtrack_records > 0 do
+        local oldest = data.backtrack_records[1]
+        if oldest and oldest.tick_count and current_tick - oldest.tick_count > CONFIG.BACKTRACK_HISTORY_SIZE then
+            table.remove(data.backtrack_records, 1)
+        else
+            break
+        end
+    end
+    
+    for _, rec in ipairs(data.backtrack_records) do
+        if math.abs(rec.sim_time - sim_time) < 0.001 then
+            data.prev_prev_origin = { x = data.prev_origin.x, y = data.prev_origin.y, z = data.prev_origin.z }
+            data.prev_prev_velocity = { x = data.prev_velocity.x, y = data.prev_velocity.y, z = data.prev_velocity.z }
+            data.prev_origin = { x = origin_x, y = origin_y, z = origin_z }
+            data.prev_velocity = { x = vel_x, y = vel_y, z = vel_z }
+            data.prev_sim_time = sim_time
+            return
+        end
+    end
+    
+    table.insert(data.backtrack_records, record)
+    
+    while #data.backtrack_records > CONFIG.BACKTRACK_HISTORY_SIZE do
+        table.remove(data.backtrack_records, 1)
+    end
+    
+    data.prev_prev_origin = { x = data.prev_origin.x, y = data.prev_origin.y, z = data.prev_origin.z }
+    data.prev_prev_velocity = { x = data.prev_velocity.x, y = data.prev_velocity.y, z = data.prev_velocity.z }
+    data.prev_origin = { x = origin_x, y = origin_y, z = origin_z }
+    data.prev_velocity = { x = vel_x, y = vel_y, z = vel_z }
+    data.prev_sim_time = sim_time
+end
+
+-- ============== SCORING ==============
+
+local function calculate_backtrack_score(ent, data, record, tick_diff, lp_origin, interpolated_pos, extrapolated_pos)
+    local score = 0
+    local max_ticks = ui.get(ui_elements.bt_ticks)
+    
+    local optimal_tick = 20
+    if #data.best_tick_history > 5 then
+        local sum = 0
+        for _, t in ipairs(data.best_tick_history) do sum = sum + t end
+        optimal_tick = sum / #data.best_tick_history
+    end
+    
+    local tick_score = 100 - math.abs(tick_diff - optimal_tick) * 2
+    score = score + math.max(0, tick_score)
+    
+    local dist = vec_distance(lp_origin.x, lp_origin.y, lp_origin.z, record.origin.x, record.origin.y, record.origin.z)
+    local dist_score = math.max(0, 100 - dist / 15)
+    score = score + dist_score * CONFIG.WEIGHT_DISTANCE
+    
+    local vel_score = math.max(0, 100 - record.speed / 2.5)
+    score = score + vel_score * CONFIG.WEIGHT_VELOCITY
+    
+    if record.is_lc_break then
+        score = score + 200 * CONFIG.WEIGHT_LC_BREAK
+    end
+    
+    if record.is_choking then
+        score = score + math.min(record.choke_amount * 20, 100)
+    end
+    
+    if interpolated_pos then
+        local interp_dist = vec_distance(lp_origin.x, lp_origin.y, lp_origin.z, interpolated_pos.x, interpolated_pos.y, interpolated_pos.z)
+        if interp_dist < dist then
+            score = score + 50 * CONFIG.WEIGHT_INTERPOLATED
+        end
+    end
+    
+    if extrapolated_pos and record.extrapolation_confidence > 0.5 then
+        local extrap_dist = vec_distance(lp_origin.x, lp_origin.y, lp_origin.z, extrapolated_pos.x, extrapolated_pos.y, extrapolated_pos.z)
+        if extrap_dist < dist then
+            score = score + 40 * CONFIG.WEIGHT_EXTRAPOLATED * record.extrapolation_confidence
+        end
+    end
+    
+    if ui.get(ui_elements.ie_air_pred) and not record.is_grounded then
+        score = score + 30
+    end
+    
+    if data.is_spinning then
+        score = score + tick_diff * 2.5
+        local angle_to_us = math.deg(math.atan2(lp_origin.y - record.origin.y, lp_origin.x - record.origin.x))
+        if math.abs(angle_diff(angle_to_us, record.angles.yaw)) > 90 then
+            score = score + 100
+        end
+    end
+    
+    if data.is_jitter and record.velocity_delta < 50 then
+        score = score + 80
+    end
+    
+    if data.is_extended then
+        score = score + 60
+    end
+    
+    if record.duck < 0.3 then
+        score = score + 40
+    end
+    
+    if record.confidence and record.confidence > 0.5 then
+        score = score + record.confidence * 60 * CONFIG.WEIGHT_PREDICTION_CONF
+    end
+    
+    return score
+end
+
+-- ============== GET BEST RECORD ==============
+
+local function get_best_backtrack_record(ent, data)
+    local lp = entity.get_local_player()
+    if not lp then return nil, 0, 0 end
+    
+    local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+    if not lx then return nil, 0, 0 end
+    
+    local lp_origin = { x = lx, y = ly, z = lz }
+    local max_ticks = ui.get(ui_elements.bt_ticks)
+    local current_tick = globals.tickcount()
+    
+    local best_record = nil
+    local best_score = -math.huge
+    local best_tick = 0
+    local best_interp_pos = nil
+    local best_extrap_pos = nil
+    local best_interpolated = false
+    local best_extrapolated = false
+    local best_cubic = false
+    local best_spline = false
+    local best_interp_factor = 0
+    
+    local sorted = {}
+    for _, rec in ipairs(data.backtrack_records) do
+        if rec.valid and rec.tick_count then
+            local tick_diff = current_tick - rec.tick_count
+            if tick_diff > 0 and tick_diff <= max_ticks then
+                table.insert(sorted, { record = rec, tick_diff = tick_diff, idx = _ })
+            end
+        end
+    end
+    
+    table.sort(sorted, function(a, b) return a.tick_diff < b.tick_diff end)
+    
+    local subtick_steps = ui.get(ui_elements.ie_subticks)
+    
+    for i, entry in ipairs(sorted) do
+        local record = entry.record
+        local tick_diff = entry.tick_diff
+        
+        local prev_rec = sorted[i + 1] and sorted[i + 1].record or nil
+        local next_rec = sorted[i - 1] and sorted[i - 1].record or nil
+        local prev_prev_rec = sorted[i + 2] and sorted[i + 2].record or nil
+        local next_next_rec = sorted[i - 2] and sorted[i - 2].record or nil
+        
+        if ui.get(ui_elements.ie_interpolation) and next_rec then
+            for step = 1, subtick_steps do
+                local t = step / (subtick_steps + 1)
+                local interp_pos = nil
+                local is_cubic = false
+                local is_spline = false
+                
+                if ui.get(ui_elements.ie_spline) and prev_rec and next_next_rec then
+                    interp_pos = interpolate_position_spline(prev_rec, record, next_rec, next_next_rec, t)
+                    is_spline = true
+                elseif ui.get(ui_elements.ie_interpolation) then
+                    interp_pos = interpolate_position_cubic(record, next_rec, t, (next_rec.tick_count - record.tick_count) * CONFIG.TICK_INTERVAL)
+                    is_cubic = true
+                end
+                
+                if interp_pos then
+                    local score = calculate_backtrack_score(ent, data, record, tick_diff - t, lp_origin, interp_pos, nil)
+                    
+                    if score > best_score then
+                        best_score = score
+                        best_record = record
+                        best_tick = tick_diff - t
+                        best_interp_pos = interp_pos
+                        best_interpolated = true
+                        best_cubic = is_cubic
+                        best_spline = is_spline
+                        best_interp_factor = t
+                    end
+                end
+            end
+        end
+        
+        local extrap_pos = nil
+        if ui.get(ui_elements.ie_extrapolation) and record.extrapolation_confidence > 0.5 then
+            extrap_pos = record.predicted_origin
+        end
+        
+        local score = calculate_backtrack_score(ent, data, record, tick_diff, lp_origin, nil, extrap_pos)
+        
+        if score > best_score then
+            best_score = score
+            best_record = record
+            best_tick = tick_diff
+            best_extrap_pos = extrap_pos
+            best_extrapolated = extrap_pos ~= nil
+            best_interpolated = false
+            best_cubic = false
+            best_spline = false
+            best_interp_factor = 0
+        end
+    end
+    
+    if best_tick > 0 then
+        table.insert(data.best_tick_history, math.floor(best_tick))
+        while #data.best_tick_history > 20 do table.remove(data.best_tick_history, 1) end
+    end
+    
+    return best_record, best_tick, best_score, best_interp_pos, best_extrap_pos, best_interpolated, best_extrapolated, best_cubic, best_spline, best_interp_factor
+end
+
+-- ============== APPLY BACKTRACK ==============
+
+local function apply_backtrack(cmd, ent, data, record, tick_diff, score, interp_pos, extrap_pos, is_interpolated, is_extrapolated, is_cubic, is_spline, interp_factor)
+    if not record then return false end
+    
+    local final_origin = record.origin
+    if is_interpolated and interp_pos then
+        final_origin = interp_pos
+    elseif is_extrapolated and extrap_pos then
+        final_origin = extrap_pos
+    end
+    
+    cmd.tickcount = record.tick_count + (is_interpolated and math.floor(interp_factor) or 0)
+    
+    data.backtrack_target_tick = tick_diff
+    data.backtrack_sim_time = record.sim_time
+    data.backtrack_origin = final_origin
+    data.backtrack_angles = { pitch = record.angles.pitch, yaw = record.angles.yaw }
+    data.backtrack_velocity = record.velocity
+    data.backtrack_is_valid = true
+    data.backtrack_score = score
+    data.backtrack_is_interpolated = is_interpolated
+    data.backtrack_is_extrapolated = is_extrapolated
+    data.backtrack_is_cubic = is_cubic
+    data.backtrack_is_spline = is_spline
+    data.backtrack_interp_factor = interp_factor
+    
+    global_stats.backtrack_shots = global_stats.backtrack_shots + 1
+    global_stats.backtrack_ticks_used = global_stats.backtrack_ticks_used + tick_diff
+    global_stats.backtrack_best_score = math.max(global_stats.backtrack_best_score, score)
+    
+    if record.is_lc_break then
+        global_stats.backtrack_lc_breaks = global_stats.backtrack_lc_breaks + 1
+    end
+    
+    if is_interpolated then
+        global_stats.backtrack_interpolated_hits = global_stats.backtrack_interpolated_hits + 1
+        if is_cubic then global_stats.backtrack_cubic_hits = global_stats.backtrack_cubic_hits + 1 end
+        if is_spline then global_stats.backtrack_spline_hits = global_stats.backtrack_spline_hits + 1 end
+    end
+    
+    if is_extrapolated then
+        global_stats.backtrack_extrapolated_hits = global_stats.backtrack_extrapolated_hits + 1
+        if not record.is_grounded then
+            global_stats.backtrack_air_pred_hits = global_stats.backtrack_air_pred_hits + 1
+        end
+    end
+    
+    if global_stats.backtrack_shots > 0 then
+        global_stats.backtrack_avg_tick = global_stats.backtrack_ticks_used / global_stats.backtrack_shots
+    end
+    
+    return true
+end
+
+-- ============== POSE & ANIMATION ==============
+
+local function read_pose(ent, data)
+    local body_yaw = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_YAW)
+    if body_yaw then
+        data.pose_body_yaw = body_yaw
+        data.pose_body_yaw_angle = (body_yaw - 0.5) * 360
+    end
+    
+    local body_pitch = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_PITCH)
+    if body_pitch then
+        data.pose_body_pitch = body_pitch
+        local pitch_angle = (body_pitch - 0.5) * 360
+        data.has_roll = math.abs(pitch_angle) > 45
+    end
+end
+
+local function analyze_anim_layers(ent, data)
+    local layer3_w = entity.get_prop(ent, "m_flLayerWeight", 3) or 0
+    local layer4_w = entity.get_prop(ent, "m_flLayerWeight", 4) or 0
+    local total = layer3_w + layer4_w
+    
+    if total > 0.7 then
+        data.is_extended = true
+        data.extended_desync_amount = total * 120
+        data.bodyyaw_side = layer3_w > layer4_w and SIDES.LEFT or SIDES.RIGHT
+        return true
+    end
+    
+    data.is_extended = false
+    return false
+end
+
+-- ============== JITTER ==============
+
+local function analyze_jitter(data, eye_yaw)
+    if #data.angle_history < 5 then return end
+    
+    local changes = {}
+    local oscillations = 0
+    local last_dir = 0
+    
+    for i = #data.angle_history, math.max(1, #data.angle_history - 30), -1 do
+        if i > 1 and data.angle_history[i] and data.angle_history[i-1] then
+            local diff = angle_diff(data.angle_history[i].angle, data.angle_history[i-1].angle)
+            table.insert(changes, diff)
+            
+            local dir = diff > 0 and 1 or -1
+            if last_dir ~= 0 and dir ~= last_dir then oscillations = oscillations + 1 end
+            last_dir = dir
+        end
+    end
+    
+    if #changes < 3 then return end
+    
+    local avg = 0
+    for _, v in ipairs(changes) do avg = avg + math.abs(v) end
+    avg = avg / #changes
+    
+    local variance = 0
+    for _, v in ipairs(changes) do variance = variance + (math.abs(v) - avg) ^ 2 end
+    variance = math.sqrt(variance / #changes)
+    
+    data.jitter_score = variance
+    data.avg_angle_change = avg
+    data.angle_variance = variance
+    data.jitter_phase = oscillations
+    
+    data.is_jitter = variance > CONFIG.JITTER_THRESHOLD or oscillations > 5
+end
+
+-- ============== SPINBOT ==============
+
+local function analyze_spin(data, eye_yaw)
+    if #data.angle_history < 6 then return false end
+    
+    local total_rotation = 0
+    local samples = 0
+    local dir_votes = { left = 0, right = 0 }
+    
+    for i = #data.angle_history, math.max(1, #data.angle_history - 25), -1 do
+        if i > 1 and data.angle_history[i] and data.angle_history[i-1] then
+            local diff = angle_diff(data.angle_history[i].angle, data.angle_history[i-1].angle)
+            total_rotation = total_rotation + math.abs(diff)
+            samples = samples + 1
+            
+            if diff > 0 then dir_votes.right = dir_votes.right + 1
+            else dir_votes.left = dir_votes.left + 1 end
+        end
+    end
+    
+    if samples == 0 then return false end
+    
+    local avg_speed = total_rotation / samples
+    local direction = dir_votes.right > dir_votes.left and 1 or -1
+    local consistency = math.abs(dir_votes.right - dir_votes.left) / samples
+    
+    data.spin_speed = avg_speed
+    data.spin_direction = direction
+    
+    if avg_speed > CONFIG.SPIN_THRESHOLD and consistency > 0.55 then
+        data.is_spinning = true
+        return true
+    end
+    
+    data.is_spinning = false
+    return false
+end
+
+-- ============== EXTENDED DESYNC ==============
+
+local function analyze_extended_desync(ent, data)
+    if data.pose_body_yaw_angle then
+        local diff = math.abs(data.pose_body_yaw_angle)
+        if diff > CONFIG.EXTENDED_DESYNC_THRESHOLD then
+            data.is_extended = true
+            data.extended_desync_amount = diff
+            data.bodyyaw_side = data.pose_body_yaw_angle > 0 and SIDES.LEFT or SIDES.RIGHT
+            return true
+        end
+    end
+    
+    if analyze_anim_layers(ent, data) then return true end
+    
+    data.is_extended = false
+    return false
+end
+
+-- ============== VELOCITY ==============
+
+local function analyze_velocity(ent, data)
+    local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
+    local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
+    local vz = entity.get_prop(ent, "m_vecVelocity[2]") or 0
+    local speed = math.sqrt(vx*vx + vy*vy)
+    local current_time = globals.realtime()
+    
+    table.insert(data.velocity_history, { x = vx, y = vy, z = vz, speed = speed, time = current_time })
+    while #data.velocity_history > CONFIG.MAX_VELOCITY do table.remove(data.velocity_history, 1) end
+    
+    data.is_moving = speed > 10
+    
+    if #data.velocity_history >= 10 then
+        local speeds = {}
+        for i = #data.velocity_history - 9, #data.velocity_history do
+            table.insert(speeds, data.velocity_history[i].speed)
+        end
+        local avg = 0
+        for _, s in ipairs(speeds) do avg = avg + s end
+        avg = avg / 10
+        
+        local var = 0
+        for _, s in ipairs(speeds) do var = var + (s - avg) ^ 2 end
+        data.velocity_variance = math.sqrt(var / 10)
+        
+        data.is_fakewalking = avg < 25 and data.velocity_variance > 35
+    end
+    
+    if speed > 35 then
+        local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+        if eye_yaw then
+            local move_angle = math.deg(math.atan2(vy, vx))
+            local diff = angle_diff(move_angle, eye_yaw)
+            
+            if diff > 22 and diff < 158 then return SIDES.RIGHT, 0.78
+            elseif diff < -22 and diff > -158 then return SIDES.LEFT, 0.78
+            elseif math.abs(diff) <= 22 then return SIDES.CENTER, 0.65 end
+        end
+    end
+    
+    if speed > 2 and speed < 18 then
+        data.is_micro_moving = true
+        return data.predicted_side * -1, 0.52
+    else
+        data.is_micro_moving = false
+    end
+    
+    local duck = entity.get_prop(ent, "m_flDuckAmount") or 0
+    data.is_crouching = duck > 0.5
+    
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    data.is_air = bit.band(flags, 1) == 0
+    
+    return SIDES.CENTER, 0.18
+end
+
+-- ============== FREESTAND ==============
+
+local function analyze_freestand(ent, data)
+    local lp = entity.get_local_player()
+    if not lp then return SIDES.CENTER, 0 end
+    
+    local lx, ly = entity.get_prop(lp, "m_vecOrigin")
+    local ex, ey = entity.get_prop(ent, "m_vecOrigin")
+    if not lx or not ex then return SIDES.CENTER, 0 end
+    
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+    if not eye_yaw then return SIDES.CENTER, 0 end
+    
+    local dx = lx - ex
+    local dy = ly - ey
+    local angle_to_local = math.deg(math.atan2(dy, dx))
+    local diff = angle_diff(angle_to_local, eye_yaw)
+    
+    if math.abs(diff) > 70 then
+        data.is_freestanding = true
+        data.freestand_side = diff > 0 and SIDES.LEFT or SIDES.RIGHT
+        return data.freestand_side, 0.75
+    end
+    
+    data.is_freestanding = false
+    return SIDES.CENTER, 0.12
+end
+
+-- ============== MEMORY ==============
+
+local function analyze_memory(data)
+    if #data.successful_resolves < 2 then return SIDES.CENTER, 0 end
+    
+    local current_time = globals.realtime()
+    local left_w = 0
+    local right_w = 0
+    local total_w = 0
+    
+    for _, res in ipairs(data.successful_resolves) do
+        local age = current_time - res.time
+        local weight = math.exp(-age / CONFIG.MEMORY_DECAY_TIME) * (res.confidence or 0.5)
+        if age < 5 then weight = weight * 1.5 end
+        total_w = total_w + weight
+        
+        if res.side == SIDES.LEFT then left_w = left_w + weight
+        elseif res.side == SIDES.RIGHT then right_w = right_w + weight end
+    end
+    
+    if total_w < 0.25 then return SIDES.CENTER, 0 end
+    
+    local left_ratio = left_w / total_w
+    local right_ratio = right_w / total_w
+    
+    if left_ratio > 0.55 then return SIDES.LEFT, left_ratio * 0.92
+    elseif right_ratio > 0.55 then return SIDES.RIGHT, right_ratio * 0.92 end
+    
+    return SIDES.CENTER, 0.18
+end
+
+-- ============== DOUBLE TAP ==============
+
+local function detect_dt(data)
+    if not ui.get(ui_elements.dt_predict) then return false end
+    
+    local ct = globals.realtime()
+    for i = #data.dt_shots, 1, -1 do
+        if ct - data.dt_shots[i].time > 1.0 then table.remove(data.dt_shots, i) end
+    end
+    
+    if #data.dt_shots < CONFIG.DT_SHOT_THRESHOLD then return false end
+    
+    local total_int = 0
+    local ints = {}
+    for i = 2, #data.dt_shots do
+        local int = data.dt_shots[i].time - data.dt_shots[i-1].time
+        if int < CONFIG.DT_TIME_THRESHOLD then
+            total_int = total_int + int
+            table.insert(ints, int)
+        end
+    end
+    
+    if #ints == 0 then return false end
+    
+    local avg = total_int / #ints
+    
+    if avg < 0.10 then data.dt_confidence = 0.92
+    elseif avg < 0.15 then data.dt_confidence = 0.80
+    elseif avg < CONFIG.DT_TIME_THRESHOLD then data.dt_confidence = 0.60
+    else data.dt_detected = false return false end
+    
+    data.dt_detected = true
+    data.dt_firing_speed = 1.0 / avg
+    data.dt_predicted_side = data.predicted_side ~= 0 and data.predicted_side or SIDES.LEFT
+    data.dt_angle_offset = data.dt_predicted_side * ui.get(ui_elements.dt_aggression)
+    
+    return true
+end
+
+local function track_shot(data)
+    table.insert(data.dt_shots, { time = globals.realtime() })
+    while #data.dt_shots > 25 do table.remove(data.dt_shots, 1) end
+    detect_dt(data)
+end
+
+-- ============== PATTERN ==============
+
+local function recognize_pattern(data)
+    if data.is_spinning then return "spin", 0.90 end
+    if data.is_jitter then return "jitter", 0.85 end
+    if data.is_extended then return "extended", 0.82 end
+    if data.is_fakewalking then return "fakewalk", 0.70 end
+    if data.avg_angle_change < 3 and data.angle_variance < 15 then return "static", 0.78 end
+    if data.avg_angle_change > 10 and data.avg_angle_change < 60 and data.jitter_phase > 2 then return "sway", 0.65 end
+    return "unknown", 0.25
+end
+
+-- ============== SHOT CORRELATION ==============
+
+local function analyze_shot_correlation(data)
+    local sc = data.shot_correlation
+    if sc.total < 2 then return 60, 0.35 end
+    
+    local best_angle = 60
+    local best_rate = 0
+    
+    for angle, rate in pairs(data.angle_success_rate) do
+        if rate > best_rate then
+            best_rate = rate
+            best_angle = angle
+        end
+    end
+    
+    return best_angle, math.min(best_rate, 0.95)
+end
+
+local function record_shot_result(data, angle, hit)
+    local sc = data.shot_correlation
+    sc.total = sc.total + 1
+    
+    local angle_key = math.floor(angle / 10) * 10
+    
+    if not data.angle_success_rate[angle_key] then
+        data.angle_success_rate[angle_key] = 0.5
+    end
+    
+    if hit then
+        data.angle_success_rate[angle_key] = math.min(data.angle_success_rate[angle_key] + 0.1, 1.0)
+    else
+        data.angle_success_rate[angle_key] = math.max(data.angle_success_rate[angle_key] - 0.05, 0.0)
+    end
+end
+
+-- ============== PREDICTION ==============
+
+local function get_prediction(ent)
+    local data = get_data(ent)
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+    
+    if not eye_yaw then return 60, 0.35 end
+    
+    local predictions = {}
+    local base_weight = 1.5
+    
+    -- Check cloud data first if enabled
+    if ui.get(ui_elements.cloud_enabled) then
+        local cloud_data = cloud_resolver.get_data(ent)
+        if cloud_data and cloud_data.confidence >= CONFIG.CLOUD_MIN_CONFIDENCE then
+            data.cloud_angle = cloud_data.angle
+            data.cloud_confidence = cloud_data.confidence
+            data.cloud_last_update = globals.realtime()
+            
+            table.insert(predictions, { 
+                side = cloud_data.angle > 0 and SIDES.LEFT or SIDES.RIGHT, 
+                conf = cloud_data.confidence, 
+                weight = base_weight * CONFIG.CLOUD_WEIGHT,
+                source = "cloud"
+            })
+        end
+    end
+    
+    local v_side, v_conf = analyze_velocity(ent, data)
+    if v_conf > 0.25 then
+        table.insert(predictions, { side = v_side, conf = v_conf, weight = base_weight * 1.15 })
+    end
+    
+    local pattern, p_conf = recognize_pattern(data)
+    if p_conf > 0.25 then
+        local side = SIDES.CENTER
+        if pattern == "spin" then
+            side = data.spin_direction * -1
+            p_conf = p_conf * 0.88
+        elseif pattern == "jitter" then
+            side = (data.predicted_side ~= 0 and data.predicted_side or SIDES.LEFT) * -1
+            p_conf = p_conf * 0.82
+        elseif pattern == "extended" then
+            side = data.bodyyaw_side
+            p_conf = p_conf * 0.92
+        end
+        table.insert(predictions, { side = side, conf = p_conf, weight = base_weight * 1.4 })
+    end
+    
+    local m_side, m_conf = analyze_memory(data)
+    if m_conf > 0.30 then
+        table.insert(predictions, { side = m_side, conf = m_conf, weight = base_weight * 1.7 })
+    end
+    
+    local f_side, f_conf = analyze_freestand(ent, data)
+    if f_conf > 0.25 then
+        table.insert(predictions, { side = f_side, conf = f_conf, weight = base_weight * 1.25 })
+    end
+    
+    if analyze_extended_desync(ent, data) then
+        table.insert(predictions, { side = data.bodyyaw_side, conf = 0.80, weight = base_weight * 1.5 })
+    end
+    
+    if detect_dt(data) then
+        table.insert(predictions, { side = data.dt_predicted_side, conf = data.dt_confidence * 0.85, weight = base_weight * 1.9 })
+    end
+    
+    if #predictions == 0 then return 60, 0.35 end
+    
+    local total_w = 0
+    local weighted_side = 0
+    local has_cloud = false
+    
+    for _, p in ipairs(predictions) do
+        weighted_side = weighted_side + (p.side * p.conf * p.weight)
+        total_w = total_w + (p.conf * p.weight)
+        if p.source == "cloud" then has_cloud = true end
+    end
+    
+    local final_side = total_w > 0 and weighted_side / total_w or 0
+    local final_conf = total_w > 0 and total_w / #predictions or 0.35
+    
+    if final_side > 0.18 then final_side = SIDES.LEFT
+    elseif final_side < -0.18 then final_side = SIDES.RIGHT
+    else final_side = SIDES.CENTER end
+    
+    local aggression = ui.get(ui_elements.aggression) / 5
+    local angle = final_side * CONFIG.EXTENDED_DESYNC_MAX * final_conf * aggression
+    
+    if data.is_jitter then angle = angle * 0.82 end
+    if data.is_spinning then angle = angle + data.spin_direction * data.spin_speed * 0.25 end
+    if data.is_extended then angle = angle * 1.15 end
+    if data.dt_detected then angle = angle + data.dt_angle_offset end
+    
+    angle = clamp(angle, -165, 165)
+    
+    data.predicted_side = final_side
+    data.confidence = final_conf
+    data.cloud_used = has_cloud
+    
+    return angle, final_conf
+end
+
+-- ============== BRUTEFORCE ==============
+
+local function get_bf_angle(data)
+    local strategy = ui.get(ui_elements.bf_mode)
+    
+    if strategy == "Smart Adaptive" then
+        local pattern = BF_PATTERNS.Smart_Adaptive
+        local entry = pattern[((data.bf_index - 1) % #pattern) + 1]
+        return clamp(entry.angle + math.random(-4, 4), -165, 165), 0.35 + entry.weight * 0.1
+    elseif strategy == "Multi-Stage Pro" then
+        local angles = BF_PATTERNS.Multi_Stage_Pro[data.bf_state.stage] or BF_PATTERNS.Multi_Stage_Pro[1]
+        return angles[((data.bf_index - 1) % #angles) + 1] + math.random(-5, 5), 0.32 + data.bf_state.stage * 0.06
+    elseif strategy == "Anti-Jitter" then
+        return BF_PATTERNS.Anti_Jitter[((data.bf_index - 1) % #BF_PATTERNS.Anti_Jitter) + 1], 0.42
+    elseif strategy == "Anti-Spin" then
+        return BF_PATTERNS.Anti_Spin[((data.bf_index - 1) % #BF_PATTERNS.Anti_Spin) + 1] + data.spin_direction * 35, 0.45
+    elseif strategy == "Extended" then
+        return BF_PATTERNS.Extended[((data.bf_index - 1) % #BF_PATTERNS.Extended) + 1], 0.50
+    end
+    
+    return 60, 0.35
+end
+
+local function advance_bf(data, hit)
+    if hit then
+        table.insert(data.hit_angles, data.bf_angle)
+        if #data.hit_angles > 20 then table.remove(data.hit_angles, 1) end
+        return
+    end
+    
+    if data.consecutive_misses < ui.get(ui_elements.bf_delay) then return end
+    
+    data.bf_index = data.bf_index + 1
+    
+    if ui.get(ui_elements.bf_mode) == "Multi-Stage Pro" then
+        if data.bf_index > #(BF_PATTERNS.Multi_Stage_Pro[data.bf_state.stage] or {}) then
+            data.bf_index = 1
+            data.bf_state.stage = (data.bf_state.stage % 5) + 1
+        end
+    end
+end
+
+-- ============== APPLY ==============
+
+local function apply_resolve(ent, angle, conf)
+    if not entity.is_alive(ent) then return end
+    
+    local data = get_data(ent)
+    local ct = globals.realtime()
+    
+    if ct - data.last_plist_update < CONFIG.SAMPLE_RATE then return end
+    data.last_plist_update = ct
+    
+    if ui.get(ui_elements.resolve_method) == "PList Force" or ui.get(ui_elements.resolve_method) == "Hybrid (All)" then
+        plist_set_force_angle(ent, angle)
+        data.force_angle = angle
+        data.is_resolved = true
+    end
+end
+
+-- ============== MAIN RESOLVER ==============
+
+local function resolve(ent)
+    if not ui.get(ui_elements.enabled) then return 60, 0.35 end
+    if not entity.is_alive(ent) then return 60, 0.35 end
+    
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+    if not eye_yaw then return 60, 0.35 end
+    
+    local data = get_data(ent)
+    local ct = globals.realtime()
+    
+    table.insert(data.angle_history, { angle = eye_yaw, time = ct })
+    while #data.angle_history > CONFIG.MAX_HISTORY do table.remove(data.angle_history, 1) end
+    
+    read_pose(ent, data)
+    analyze_jitter(data, eye_yaw)
+    analyze_spin(data, eye_yaw)
+    analyze_extended_desync(ent, data)
+    analyze_velocity(ent, data)
+    
+    record_backtrack(ent, data)
+    
+    local angle = 60
+    local conf = 0.35
+    local mode = ui.get(ui_elements.mode)
+    
+    if ui.get(ui_elements.override_key) then
+        local ov = ui.get(ui_elements.override_mode)
+        if ov == "Left" then angle = CONFIG.DESYNC_MAX
+        elseif ov == "Right" then angle = -CONFIG.DESYNC_MAX
+        elseif ov == "Opposite" then angle = -data.predicted_side * CONFIG.DESYNC_MAX
+        else angle = (data.predicted_side or 1) * CONFIG.DESYNC_MAX end
+        apply_resolve(ent, angle, 1.0)
+        return angle, 1.0
+    end
+    
+    -- Mode selection with Cloud Priority
+    if mode == "Cloud Priority" then
+        -- Check cloud data first
+        if ui.get(ui_elements.cloud_enabled) then
+            local cloud_data = cloud_resolver.get_data(ent)
+            if cloud_data and cloud_data.confidence >= 0.6 then
+                angle = cloud_data.angle
+                conf = cloud_data.confidence
+                data.cloud_used = true
+                global_stats.cloud_resolves = global_stats.cloud_resolves + 1
+            else
+                local p_angle, p_conf = get_prediction(ent)
+                angle, conf = p_angle, p_conf
+            end
+        else
+            local p_angle, p_conf = get_prediction(ent)
+            angle, conf = p_angle, p_conf
+        end
+    elseif mode == "Adaptive Pro" then
+        local p_angle, p_conf = get_prediction(ent)
+        if p_conf > 0.30 then angle, conf = p_angle, p_conf
+        else angle, conf = get_bf_angle(data) end
+    elseif mode == "Deep Memory" then
+        local m_side, m_conf = analyze_memory(data)
+        if m_conf > 0.40 then angle, conf = m_side * CONFIG.DESYNC_MAX, m_conf
+        else angle, conf = get_prediction(ent) end
+    elseif mode == "Animation+" then
+        if analyze_extended_desync(ent, data) then angle, conf = data.bodyyaw_side * CONFIG.EXTENDED_DESYNC_MAX, 0.78
+        else angle, conf = get_prediction(ent) end
+    elseif mode == "Extended+" then
+        if data.is_extended then angle, conf = data.bodyyaw_side * math.min(data.extended_desync_amount * 1.25, 165), 0.82
+        else angle, conf = get_bf_angle(data) end
+    elseif mode == "Smart BF" then
+        angle, conf = get_bf_angle(data)
+    elseif mode == "Anti-Everything" then
+        local p_angle, p_conf = get_prediction(ent)
+        if data.is_spinning then angle, conf = data.spin_direction * -90, 0.75
+        elseif data.is_jitter then angle, conf = p_angle * 0.85, p_conf
+        elseif data.is_extended then angle, conf = data.bodyyaw_side * CONFIG.EXTENDED_DESYNC_MAX, 0.80
+        else angle, conf = p_angle, p_conf end
+    end
+    
+    angle = tonumber(angle) or 60
+    conf = tonumber(conf) or 0.35
+    angle = clamp(angle, -165, 165)
+    conf = clamp(conf, 0, 1)
+    
+    local min_conf = ui.get(ui_elements.confidence_min) / 100
+    if conf < min_conf then conf = min_conf end
+    
+    data.last_resolve = angle
+    data.bf_angle = angle
+    data.last_update = ct
+    
+    apply_resolve(ent, angle, conf)
+    
+    global_stats.total_resolves = global_stats.total_resolves + 1
+    
+    return angle, conf
+end
+
+-- ============== SETUP COMMAND ==============
+
+client.set_event_callback("setup_command", function(cmd)
+    if not ui.get(ui_elements.enabled) then return end
+    
+    local lp = entity.get_local_player()
+    if not lp or not entity.is_alive(lp) then return end
+    
+    -- Init cloud resolver
+    if ui.get(ui_elements.cloud_enabled) then
+        if not cloud_state.initialized then
+            cloud_resolver.init()
+        end
+        
+        -- Update server URL from UI
+        local url = ui.get(ui_elements.cloud_url)
+        if url and url ~= "" then
+            CLOUD_CONFIG.SERVER_URL = url
+        end
+        
+        -- Poll cloud data
+        cloud_resolver.poll()
+        
+        -- Clean old data periodically
+        if globals.tickcount() % 100 == 0 then
+            cloud_resolver.clean()
+        end
+    end
+    
+    local players = entity.get_players(true)
+    if not players then return end
+    
+    for _, ent in ipairs(players) do
+        if entity.is_alive(ent) then
+            resolve(ent)
+            
+            local data = get_data(ent)
+            local wpn = entity.get_player_weapon(ent)
+            if wpn then
+                local ammo = entity.get_prop(wpn, "m_iClip1") or 0
+                if data.last_ammo > ammo and ammo >= 0 then track_shot(data) end
+                data.last_ammo = ammo
+            end
+        end
+    end
+end)
+
+-- ============== EVENTS ==============
+
+client.set_event_callback("aim_fire", function(e)
+    if not ui.get(ui_elements.enabled) then return end
+    
+    local ent = e.target
+    if not ent then return end
+    
+    local data = get_data(ent)
+    data.shots = data.shots + 1
+    data.last_shot_time = globals.realtime()
+    global_stats.shots = global_stats.shots + 1
+    
+    local angle, conf = resolve(ent)
+    
+    local record, tick_diff, score, interp_pos, extrap_pos, is_interp, is_extrap, is_cubic, is_spline, interp_factor = get_best_backtrack_record(ent, data)
+    
+    if record then
+        apply_backtrack(e, ent, data, record, tick_diff, score, interp_pos, extrap_pos, is_interp, is_extrap, is_cubic, is_spline, interp_factor)
+        
+        local flags = ""
+        if is_interp then
+            if is_spline then flags = "SPLINE"
+            elseif is_cubic then flags = "CUBIC" end
+        elseif is_extrap then
+            flags = "EXTRAP"
+            if not record.is_grounded then flags = "AIR" end
+        end
+        
+        if ui.get(ui_elements.log_hits) then
+            local cloud_str = data.cloud_used and " [CLOUD]" or ""
+            client.log(string.format("[FIRE] T:%d | BT:%.1f ticks (%.0f) | %s%s", ent, tick_diff, score, flags, cloud_str))
+        end
+    else
+        if ui.get(ui_elements.log_hits) then
+            client.log(string.format("[FIRE] T:%d | BT:N/A", ent))
+        end
+    end
+end)
+
+client.set_event_callback("aim_hit", function(e)
+    if not ui.get(ui_elements.enabled) then return end
+    
+    local ent = e.target
+    if not ent then return end
+    
+    local data = get_data(ent)
+    
+    data.hits = data.hits + 1
+    data.consecutive_hits = data.consecutive_hits + 1
+    data.consecutive_misses = 0
+    
+    global_stats.hits = global_stats.hits + 1
+    global_stats.streak_current = global_stats.streak_current + 1
+    global_stats.streak_best = math.max(global_stats.streak_best, global_stats.streak_current)
+    
+    if data.backtrack_is_valid then
+        global_stats.backtrack_hits = global_stats.backtrack_hits + 1
+    end
+    
+    if data.cloud_used then
+        global_stats.cloud_hits = global_stats.cloud_hits + 1
+    end
+    
+    table.insert(data.successful_resolves, {
+        side = data.last_resolve > 0 and SIDES.LEFT or SIDES.RIGHT,
+        angle = data.last_resolve,
+        confidence = data.confidence,
+        time = globals.realtime()
+    })
+    if #data.successful_resolves > CONFIG.MAX_ANGLES then table.remove(data.successful_resolves, 1) end
+    
+    record_shot_result(data, data.last_resolve, true)
+    
+    -- Send to cloud
+    if ui.get(ui_elements.cloud_enabled) then
+        local steam64 = entity.get_steam64(ent)
+        if steam64 and steam64 ~= 0 then
+            cloud_resolver.report_data(steam64, data.last_resolve, data.confidence, true, data.detected_pattern)
+        end
+    end
+    
+    global_stats.resolved = global_stats.resolved + 1
+    if data.is_extended then global_stats.extended_hits = global_stats.extended_hits + 1 end
+    if data.is_spinning then global_stats.spin_hits = global_stats.spin_hits + 1 end
+    if data.is_jitter then global_stats.jitter_hits = global_stats.jitter_hits + 1 end
+    
+    if global_stats.shots > 0 then
+        global_stats.prediction_accuracy = global_stats.hits / global_stats.shots
+    end
+    
+    advance_bf(data, true)
+    
+    if ui.get(ui_elements.log_hits) then
+        local bt_info = ""
+        if data.backtrack_is_valid then
+            local type_str = ""
+            if data.backtrack_is_spline then type_str = " [SPLINE]"
+            elseif data.backtrack_is_cubic then type_str = " [CUBIC]"
+            elseif data.backtrack_is_extrapolated then type_str = " [EXTRAP]" end
+            bt_info = string.format(" | BT:%.1f%s", data.backtrack_target_tick, type_str)
+        end
+        local cloud_str = data.cloud_used and " [CLOUD]" or ""
+        client.log(string.format("[HIT] T:%d | Streak:%d%s%s", ent, data.consecutive_hits, bt_info, cloud_str))
+    end
+    
+    data.backtrack_is_valid = false
+    data.cloud_used = false
+end)
+
+client.set_event_callback("aim_miss", function(e)
+    if not ui.get(ui_elements.enabled) then return end
+    
+    local ent = e.target
+    if not ent then return end
+    
+    local reason = e.reason or ""
+    if reason ~= "prediction error" and reason ~= "resolver" then return end
+    
+    local data = get_data(ent)
+    
+    data.misses = data.misses + 1
+    data.consecutive_misses = data.consecutive_misses + 1
+    data.consecutive_hits = 0
+    
+    global_stats.misses = global_stats.misses + 1
+    global_stats.streak_current = 0
+    
+    -- Send miss to cloud (lower confidence)
+    if ui.get(ui_elements.cloud_enabled) then
+        local steam64 = entity.get_steam64(ent)
+        if steam64 and steam64 ~= 0 then
+            cloud_resolver.report_data(steam64, data.last_resolve, math.max(0.1, data.confidence - 0.2), false, data.detected_pattern)
+        end
+    end
+    
+    record_shot_result(data, data.last_resolve, false)
+    advance_bf(data, false)
+    
+    if ui.get(ui_elements.log_hits) then
+        client.log(string.format("[MISS] T:%d | %s", ent, reason))
+    end
+    
+    data.backtrack_is_valid = false
+    data.cloud_used = false
+end)
+
+-- ============== VISUALIZATION ==============
+
+client.set_event_callback("paint", function()
+    if not ui.get(ui_elements.enabled) then return end
+    
+    if ui.get(ui_elements.bt_visualize) then
+        local players = entity.get_players(true)
+        if players then
+            for _, ent in ipairs(players) do
+                if entity.is_alive(ent) then
+                    local data = get_data(ent)
+                    
+                    for i, record in ipairs(data.backtrack_records) do
+                        if record.valid then
+                            local x, y = renderer.world_to_screen(record.origin.x, record.origin.y, record.origin.z + 5)
+                            
+                            if x and y then
+                                local tick_diff = globals.tickcount() - record.tick_count
+                                local alpha = math.max(50, 255 - tick_diff * 5)
+                                
+                                local r, g, b = 100, 255, 100
+                                if tick_diff > 30 then r, g, b = 255, 100, 100
+                                elseif tick_diff > 20 then r, g, b = 255, 255, 100 end
+                                
+                                if record.is_lc_break then r, g, b = 255, 0, 255 end
+                                if not record.is_grounded then r, g, b = 0, 255, 255 end
+                                
+                                renderer.circle(x, y, r, g, b, alpha, nil, 3, 0, 1)
+                            end
+                            
+                            if record.predicted_origin then
+                                local px, py = renderer.world_to_screen(record.predicted_origin.x, record.predicted_origin.y, record.predicted_origin.z + 5)
+                                if px and py then
+                                    renderer.circle(px, py, 255, 255, 255, 80, nil, 2, 0, 1)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if not ui.get(ui_elements.show_stats) then return end
+    
+    local lp = entity.get_local_player()
+    if not lp or not entity.is_alive(lp) then return end
+    
+    local x, y = 10, 200
+    
+    renderer.text(x, y, 255, 255, 255, 255, "", 0, "══════ RESOLVER v18 ══════")
+    y = y + 12
+    
+    -- Cloud status
+    if ui.get(ui_elements.cloud_enabled) then
+        local cloud_status = cloud_state.initialized and "CONNECTED" or "CONNECTING..."
+        local r, g, b = cloud_state.initialized and 100 or 255, cloud_state.initialized and 255 or 100, 100
+        renderer.text(x, y, r, g, b, 255, "", 0, string.format("CLOUD: %s | Syncs: %d", cloud_status, cloud_state.sync_count))
+        y = y + 12
+    end
+    
+    local interp = ui.get(ui_elements.ie_interpolation) and "CUBIC" or ""
+    local spline = ui.get(ui_elements.ie_spline) and "SPLINE" or ""
+    local extrap = ui.get(ui_elements.ie_extrapolation) and "EXTRAP" or ""
+    local air = ui.get(ui_elements.ie_air_pred) and "AIR" or ""
+    
+    renderer.text(x, y, 150, 200, 255, 255, "", 0, string.format("BT:ON | %s %s %s %s", interp, spline, extrap, air))
+    y = y + 12
+    
+    local hitrate = global_stats.shots > 0 and (global_stats.hits / global_stats.shots * 100) or 0
+    
+    renderer.text(x, y, 200, 200, 200, 255, "", 0, 
+        string.format("S:%d H:%d M:%d | %.1f%%", global_stats.shots, global_stats.hits, global_stats.misses, hitrate))
+    y = y + 12
+    
+    local bt_hitrate = global_stats.backtrack_shots > 0 and (global_stats.backtrack_hits / global_stats.backtrack_shots * 100) or 0
+    renderer.text(x, y, 100, 200, 255, 255, "", 0, 
+        string.format("BT: %d/%d (%.1f%%) | Avg:%.1f ticks", 
+            global_stats.backtrack_hits, global_stats.backtrack_shots, bt_hitrate, global_stats.backtrack_avg_tick))
+    y = y + 12
+    
+    -- Cloud stats
+    if ui.get(ui_elements.cloud_enabled) then
+        renderer.text(x, y, 100, 255, 200, 255, "", 0, 
+            string.format("Cloud: %d resolves, %d hits", global_stats.cloud_resolves, global_stats.cloud_hits))
+        y = y + 12
+    end
+    
+    renderer.text(x, y, 100, 200, 255, 255, "", 0, 
+        string.format("Interp: CUBIC:%d SPLINE:%d | Extrap: %d (Air:%d)", 
+            global_stats.backtrack_cubic_hits, global_stats.backtrack_spline_hits,
+            global_stats.backtrack_extrapolated_hits, global_stats.backtrack_air_pred_hits))
+    y = y + 12
+    
+    renderer.text(x, y, 150, 200, 255, 255, "", 0, 
+        string.format("Ext:%d Spin:%d Jit:%d", 
+            global_stats.extended_hits, global_stats.spin_hits, global_stats.jitter_hits))
+    y = y + 15
+    
+    local players = entity.get_players(true)
+    if players then
+        renderer.text(x, y, 255, 255, 255, 255, "", 0, "══════ TARGETS ══════")
+        y = y + 12
+        
+        for _, ent in ipairs(players) do
+            if entity.is_alive(ent) then
+                local data = get_data(ent)
+                local name = entity.get_player_name(ent) or "?"
+                local rate = data.shots > 0 and (data.hits / data.shots * 100) or 0
+                
+                local flags = ""
+                if data.is_jitter then flags = flags .. "J" end
+                if data.is_spinning then flags = flags .. "S" end
+                if data.is_extended then flags = flags .. "E" end
+                if data.is_air then flags = flags .. "A" end
+                if data.cloud_used then flags = flags .. "C" end
+                
+                local r, g, b = 200, 200, 200
+                if rate > 60 then r, g, b = 100, 255, 100
+                elseif rate < 35 and data.shots > 0 then r, g, b = 255, 100, 100 end
+                
+                renderer.text(x, y, r, g, b, 255, "", 0, 
+                    string.format("%s: %.0f%% | %.0f° | %s | [%s]", 
+                    name:sub(1, 10), rate, data.last_resolve, data.detected_pattern:sub(1, 4):upper(), flags))
+                y = y + 12
+            end
+        end
+    end
+end)
+
+-- ============== CLEANUP ==============
+
+client.set_event_callback("player_death", function(e)
+    local victim = client.userid_to_entindex(e.userid)
+    if victim and player_data[victim] then
+        plist_clear_force(victim)
+        player_data[victim] = nil
+    end
+end)
+
+client.set_event_callback("round_start", function()
+    local players = entity.get_players()
+    if players then
+        for _, ent in ipairs(players) do plist_clear_force(ent) end
+    end
+    
+    for _, data in pairs(player_data) do
+        data.bf_index = 1
+        data.bf_state.stage = 1
+        data.angle_history = {}
+        data.velocity_history = {}
+        data.backtrack_records = {}
+        data.consecutive_hits = 0
+        data.consecutive_misses = 0
+        data.is_jitter = false
+        data.is_spinning = false
+        data.is_extended = false
+        data.dt_detected = false
+        data.dt_shots = {}
+        data.detected_pattern = "unknown"
+        data.backtrack_is_valid = false
+        data.acceleration = { x = 0, y = 0, z = 0 }
+        data.prev_acceleration = { x = 0, y = 0, z = 0 }
+        data.cloud_used = false
+        data.cloud_angle = nil
+        data.cloud_confidence = nil
+    end
+    
+    global_stats.streak_current = 0
+    
+    client.log("[Resolver v18] Round start - Cloud Sync Enabled")
+end)
+
+client.log("[Forward HVH Resolver v18.0] Loaded - Cloud Resolver + Advanced Interpolation & Extrapolation")
