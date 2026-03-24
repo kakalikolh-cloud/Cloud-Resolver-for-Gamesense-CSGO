@@ -51,7 +51,7 @@ local CONFIG = {
     MAX_HISTORY = 200,
     MAX_ANGLES = 100,
     MAX_VELOCITY = 120,
-    MAX_BACKTRACK = 65,
+    MAX_BACKTRACK = 80,  -- Increased for extended backtrack (up to 32 ticks)
     MAX_TICKS = 40,
     
     -- Timing
@@ -1616,7 +1616,7 @@ local ui_elements = {
     end),
     
     bt_label = ui.new_label("RAGE", "Other", "━━━ Backtrack ━━━"),
-    bt_ticks = ui.new_slider("RAGE", "Other", "Max Ticks", 14, 40, 40, true, "ticks"),
+    bt_ticks = ui.new_slider("RAGE", "Other", "Max Ticks", 12, 32, 24, true, "ticks"),
     
     ie_label = ui.new_label("RAGE", "Other", "━━━ Interpolation ━━━"),
     ie_interpolation = ui.new_checkbox("RAGE", "Other", "Enable Interpolation"),
@@ -1724,7 +1724,14 @@ local function record_backtrack(ent, data)
     data.origin_delta = vec_distance(data.prev_origin.x, data.prev_origin.y, data.prev_origin.z, ox, oy, oz)
     
     -- LC break detection (Lag Compensation break - exploit for backtrack)
-    local lc_break = data.origin_delta > 64 or data.velocity_delta > 200 or not is_grounded
+    -- More aggressive detection for extended backtrack
+    local lc_break = data.origin_delta > 48 or data.velocity_delta > 150 or not is_grounded
+    
+    -- Store LC break strength for scoring
+    local lc_break_strength = 0
+    if data.origin_delta > 48 then lc_break_strength = lc_break_strength + data.origin_delta end
+    if data.velocity_delta > 150 then lc_break_strength = lc_break_strength + data.velocity_delta * 0.5 end
+    if not is_grounded then lc_break_strength = lc_break_strength + 50 end
     
     -- Calculate angle delta for jitter detection
     local angle_delta = 0
@@ -1762,6 +1769,7 @@ local function record_backtrack(ent, data)
         speed_2d = speed_2d,
         is_grounded = is_grounded,
         is_lc_break = lc_break,
+        lc_break_strength = lc_break_strength,  -- Strength of LC break for extended BT
         predicted_origin = predicted,
         confidence = data.confidence,
         resolve_angle = data.last_resolve,
@@ -1856,30 +1864,50 @@ local function get_best_backtrack_record(ent, data)
         
         -- === TICK SCORING ===
         -- Prefer fresher ticks but not too fresh
-        -- Sweet spot is around 8-15 ticks for exploit
+        -- Extended range: 8-28 ticks for skeet-style long backtrack
         if tick_diff <= 3 then
             -- Too fresh, might be interpolated weirdly
             score = score - 10
         elseif tick_diff >= 8 and tick_diff <= 18 then
-            -- Sweet spot for backtrack exploit
-            score = score + 30
+            -- Standard sweet spot for backtrack exploit
+            score = score + 25
             table.insert(reasons, "sweet_tick")
-        elseif tick_diff > 25 then
-            -- Getting old, less reliable
-            score = score - (tick_diff - 25) * 2
+        elseif tick_diff >= 18 and tick_diff <= 28 then
+            -- Extended range - higher reward for LC breaks
+            score = score + 35  -- Higher base score for extended range
+            table.insert(reasons, "extended_tick")
+        elseif tick_diff > 28 then
+            -- Very old but still possible on some servers
+            score = score + 20
+            table.insert(reasons, "ultra_tick")
         end
         
         -- === LC BREAK SCORING (HIGHEST PRIORITY) ===
+        -- LC break allows extended backtrack (20-30+ ticks)
         if rec.is_lc_break then
-            score = score + 150
+            -- Massive bonus for LC break, especially for extended range
+            local lc_bonus = 150
+            if tick_diff > 18 then
+                -- Extra bonus for extended range with LC break
+                lc_bonus = lc_bonus + (tick_diff - 18) * 10  -- +10 per tick over 18
+            end
+            -- Add LC break strength bonus
+            lc_bonus = lc_bonus + (rec.lc_break_strength or 0) * 0.3
+            score = score + lc_bonus
             table.insert(reasons, "LC_BREAK")
         end
         
         -- === VELOCITY SCORING ===
         if rec.speed then
             if rec.speed < 10 then
-                -- Stationary target - BEST
-                score = score + 80
+                -- Stationary target - BEST for extended backtrack!
+                local stationary_bonus = 80
+                if tick_diff > 18 then
+                    -- Stationary targets are GOLD for extended backtrack
+                    stationary_bonus = stationary_bonus + 30
+                    table.insert(reasons, "extended_stationary")
+                end
+                score = score + stationary_bonus
                 table.insert(reasons, "stationary")
             elseif rec.speed < 50 then
                 -- Slow moving - GOOD
@@ -1889,9 +1917,15 @@ local function get_best_backtrack_record(ent, data)
                 -- Medium speed - OK
                 score = score + 10
             elseif rec.speed > 300 then
-                -- Very fast - hard to hit
-                score = score - 30
-                table.insert(reasons, "fast")
+                -- Very fast - but might be LC break!
+                if rec.is_lc_break then
+                    -- Fast + LC break = extended backtrack opportunity
+                    score = score + 20
+                    table.insert(reasons, "fast_lc")
+                else
+                    score = score - 30
+                    table.insert(reasons, "fast")
+                end
             end
         end
         
@@ -1900,9 +1934,9 @@ local function get_best_backtrack_record(ent, data)
             score = score + 25
             table.insert(reasons, "grounded")
         else
-            -- In air - harder to predict
-            score = score - 20
-            table.insert(reasons, "air")
+            -- In air - LC break potential, great for extended backtrack!
+            score = score + 40  -- Bonus for air (LC break = extended BT)
+            table.insert(reasons, "air_lc")
         end
         
         -- === DUCK STATE SCORING ===
@@ -2791,7 +2825,8 @@ client.set_event_callback("aim_hit", function(e)
     if ui.get(ui_elements.log_hits) then
         local bt_info = ""
         if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
-            bt_info = string.format(" | BT:%d ticks", data.bt_tick_diff)
+            local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
+            bt_info = string.format(" | BT:%d%s ticks", data.bt_tick_diff, bt_type)
         end
         client.log(string.format("[HIT] T:%d | Streak:%d | Angle:%.1f%s%s", 
             ent, data.consecutive_hits, data.last_resolve, bt_info, data.cloud_used and " [CLOUD]" or ""))
