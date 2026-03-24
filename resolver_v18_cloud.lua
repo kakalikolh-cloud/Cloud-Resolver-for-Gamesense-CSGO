@@ -2188,10 +2188,11 @@ client.set_event_callback("aim_fire", function(e)
     data.shots = data.shots + 1
     global_stats.shots = global_stats.shots + 1
     
+    -- Find best backtrack record for logging
     local record, tick_diff = get_best_backtrack_record(ent, data)
     if record then
-        cmd.tickcount = record.tick_count
         data.backtrack_is_valid = true
+        data.best_bt_tick = record.tick_count
         global_stats.backtrack_shots = global_stats.backtrack_shots + 1
     end
     
