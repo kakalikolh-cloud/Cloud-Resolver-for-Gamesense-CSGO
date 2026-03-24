@@ -1545,6 +1545,7 @@ local function create_player_data()
         backtrack_score = 0,
         backtrack_target_tick = 0,
         best_bt_tick = 0,
+        bt_tick_diff = 0,  -- Actual tick difference for logging
         prev_origin = {x=0,y=0,z=0},
         prev_velocity = {x=0,y=0,z=0},
         prev_sim_time = 0,
@@ -1751,7 +1752,7 @@ local function record_backtrack(ent, data)
     
     local record = {
         sim_time = sim_time,
-        tick_count = time_to_ticks(sim_time),
+        tick_count = globals.tickcount(),  -- Use actual game tick, not sim_time conversion
         origin = {x=ox, y=oy, z=oz},
         velocity = {x=vx, y=vy, z=vz},
         angles = {yaw = yaw, pitch = pitch},
@@ -2719,11 +2720,9 @@ client.set_event_callback("setup_command", function(cmd)
             
             data.backtrack_is_valid = true
             data.best_bt_tick = best_bt_tick
+            data.bt_tick_diff = tick_diff  -- Store the actual tick difference
             
-            if CLOUD_CONFIG.DEBUG then
-                client.log(string.format("[BT] T:%d | Tick:%d | Diff:%d | Score:%.1f | %s", 
-                    closest_ent, best_bt_tick, tick_diff, score, reason))
-            end
+            -- Removed debug spam - only log significant backtrack events
         end
     end
 end)
@@ -2740,15 +2739,6 @@ client.set_event_callback("aim_fire", function(e)
     -- Check if backtrack was applied
     if data.backtrack_is_valid and data.best_bt_tick then
         global_stats.backtrack_shots = global_stats.backtrack_shots + 1
-        if ui.get(ui_elements.log_hits) then
-            local tick_diff = globals.tickcount() - data.best_bt_tick
-            client.log(string.format("[FIRE] T:%d | BT tick:%d | Diff:%d%s", 
-                ent, data.best_bt_tick, tick_diff, data.cloud_used and " [CLOUD]" or ""))
-        end
-    else
-        if ui.get(ui_elements.log_hits) then
-            client.log(string.format("[FIRE] T:%d | No BT%s", ent, data.cloud_used and " [CLOUD]" or ""))
-        end
     end
 end)
 
@@ -2800,9 +2790,8 @@ client.set_event_callback("aim_hit", function(e)
     
     if ui.get(ui_elements.log_hits) then
         local bt_info = ""
-        if data.backtrack_is_valid and data.best_bt_tick > 0 then
-            local tick_diff = globals.tickcount() - data.best_bt_tick
-            bt_info = string.format(" | BT:%d ticks", tick_diff)
+        if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
+            bt_info = string.format(" | BT:%d ticks", data.bt_tick_diff)
         end
         client.log(string.format("[HIT] T:%d | Streak:%d | Angle:%.1f%s%s", 
             ent, data.consecutive_hits, data.last_resolve, bt_info, data.cloud_used and " [CLOUD]" or ""))
@@ -2810,6 +2799,7 @@ client.set_event_callback("aim_hit", function(e)
     
     data.backtrack_is_valid = false
     data.best_bt_tick = 0
+    data.bt_tick_diff = 0
     data.cloud_used = false
 end)
 
@@ -2844,6 +2834,7 @@ client.set_event_callback("aim_miss", function(e)
     
     data.backtrack_is_valid = false
     data.best_bt_tick = 0
+    data.bt_tick_diff = 0
 end)
 
 client.set_event_callback("paint", function()
@@ -2890,6 +2881,7 @@ client.set_event_callback("round_start", function()
         data.consecutive_hits = 0
         data.consecutive_misses = 0
         data.backtrack_is_valid = false
+        data.bt_tick_diff = 0
     end
     global_stats.streak_current = 0
     client.log("[Resolver v19.0] Round start - Cloud Ready!")
