@@ -212,9 +212,11 @@ function cloud_resolver.report_data(enemy_steam64, angle, confidence, hit, patte
     
     local url = CLOUD_CONFIG.SERVER_URL .. "/resolver/update"
     
-    -- Gamesense HTTP API: http.post(url, headers, body, callback)
-    -- callback(success, response) where response.status and response.body
-    http.post(url, {["Content-Type"] = "application/json"}, payload, function(success, response)
+    -- Gamesense HTTP API: http.post(url, {body, headers}, callback)
+    http.post(url, {
+        body = payload,
+        headers = {["Content-Type"] = "application/json"}
+    }, function(success, response)
         if not success then
             cloud_state.error_count = cloud_state.error_count + 1
             cloud_state.last_error = "Request failed"
