@@ -1463,6 +1463,8 @@ local function create_player_data()
         successful_resolves = {},
         best_tick_history = {},
         dt_shots = {},
+        body_yaw_history = {},
+        duck_history = {},
         
         bf_index = 1,
         predicted_side = 0,
@@ -1485,12 +1487,13 @@ local function create_player_data()
         backtrack_is_valid = false,
         backtrack_score = 0,
         backtrack_target_tick = 0,
+        best_bt_tick = 0,
         prev_origin = {x=0,y=0,z=0},
         prev_velocity = {x=0,y=0,z=0},
         prev_sim_time = 0,
+        prev_acceleration = nil,
         acceleration = {x=0,y=0,z=0},
         avg_acceleration = {x=0,y=0,z=0},
-        prev_acceleration = nil,
         is_on_ground = true,
         predicted_origin = {x=0,y=0,z=0},
         extrapolation_confidence = 0.5,
@@ -1512,7 +1515,25 @@ local function create_player_data()
         duck_amount = 0,
         is_jumping = false,
         opposite_from_miss = nil,
-        miss_learn_time = 0
+        miss_learn_time = 0,
+        current_speed = 0,
+        velocity_trend = 0,
+        memory_left_ratio = 0,
+        memory_right_ratio = 0,
+        avg_body_yaw = 0,
+        is_fake_duck = false,
+        is_freestanding = false,
+        jitter_oscillations = 0,
+        stable_ratio = 0,
+        jitter_peak_dir = 0,
+        jitter_peak_diff = 0,
+        jitter_type = "none",
+        spin_consistency = 0,
+        spin_type = "none",
+        move_yaw_diff = 0,
+        bf_stage = 0,
+        top_source = "none",
+        resolve_source = "none"
     }
 end
 
@@ -1603,9 +1624,20 @@ local function record_backtrack(ent, data)
     local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
     local vz = entity.get_prop(ent, "m_vecVelocity[2]") or 0
     local yaw = entity.get_prop(ent, "m_angEyeAngles[1]") or 0
+    local pitch = entity.get_prop(ent, "m_angEyeAngles[0]") or 0
     local duck = entity.get_prop(ent, "m_flDuckAmount") or 0
     local flags = entity.get_prop(ent, "m_fFlags") or 0
     local is_grounded = bit.band(flags, 1) ~= 0
+    local is_ducking = bit.band(flags, 2) ~= 0
+    
+    -- Get hitbox positions for better targeting
+    local head_x, head_y, head_z = entity.hitbox_position(ent, 0)
+    local chest_x, chest_y, chest_z = entity.hitbox_position(ent, 5)
+    local stomach_x, stomach_y, stomach_z = entity.hitbox_position(ent, 4)
+    
+    -- Calculate velocity and acceleration
+    local speed = vec_length(vx, vy, vz)
+    local speed_2d = vec_length_2d(vx, vy)
     
     local dt = sim_time - (data.prev_sim_time or sim_time)
     if dt <= 0 then dt = CONFIG.TICK_INTERVAL end
@@ -1632,7 +1664,16 @@ local function record_backtrack(ent, data)
     
     data.velocity_delta = vec_distance(data.prev_velocity.x, data.prev_velocity.y, data.prev_velocity.z, vx, vy, vz)
     data.origin_delta = vec_distance(data.prev_origin.x, data.prev_origin.y, data.prev_origin.z, ox, oy, oz)
-    data.lc_break_detected = data.origin_delta > 64 or data.velocity_delta > 200
+    
+    -- LC break detection (Lag Compensation break - exploit for backtrack)
+    local lc_break = data.origin_delta > 64 or data.velocity_delta > 200 or not is_grounded
+    
+    -- Calculate angle delta for jitter detection
+    local angle_delta = 0
+    if data.angle_history and #data.angle_history > 0 then
+        local prev_yaw = data.angle_history[#data.angle_history].angle or yaw
+        angle_delta = math.abs(angle_diff(yaw, prev_yaw))
+    end
     
     -- Extrapolation
     local max_extrap = ui.get(ui_elements.ie_extrapolation_ticks)
@@ -1647,19 +1688,36 @@ local function record_backtrack(ent, data)
     )
     data.predicted_origin = predicted
     
+    -- Calculate body height for hitbox size
+    local body_height = is_ducking and 46 or 64
+    local hitbox_scale = is_ducking and 0.7 or 1.0
+    
     local record = {
         sim_time = sim_time,
         tick_count = time_to_ticks(sim_time),
         origin = {x=ox, y=oy, z=oz},
         velocity = {x=vx, y=vy, z=vz},
-        angles = {yaw = yaw},
+        angles = {yaw = yaw, pitch = pitch},
         duck = duck,
-        speed = vec_length(vx, vy, vz),
+        is_ducking = is_ducking,
+        speed = speed,
+        speed_2d = speed_2d,
         is_grounded = is_grounded,
-        is_lc_break = data.lc_break_detected,
+        is_lc_break = lc_break,
         predicted_origin = predicted,
         confidence = data.confidence,
         resolve_angle = data.last_resolve,
+        
+        -- Hitbox positions
+        head = {x = head_x, y = head_y, z = head_z},
+        chest = {x = chest_x, y = chest_y, z = chest_z},
+        stomach = {x = stomach_x, y = stomach_y, z = stomach_z},
+        
+        -- Additional scoring data
+        angle_delta = angle_delta,
+        body_height = body_height,
+        hitbox_scale = hitbox_scale,
+        
         valid = true
     }
     
@@ -1683,51 +1741,193 @@ local function record_backtrack(ent, data)
     data.prev_sim_time = sim_time
 end
 
--- Best backtrack record
+-- Best backtrack record with advanced scoring
 local function get_best_backtrack_record(ent, data)
     local lp = entity.get_local_player()
-    if not lp then return nil, 0, 0 end
+    if not lp then return nil, 0, 0, "no_local_player" end
     
     local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
-    if not lx then return nil, 0, 0 end
+    if not lx then return nil, 0, 0, "no_origin" end
+    
+    local eye_x, eye_y, eye_z = client.eye_position()
+    if not eye_x then eye_x, eye_y, eye_z = lx, ly, lz + 64 end
     
     local max_ticks = ui.get(ui_elements.bt_ticks)
     local current_tick = globals.tickcount()
+    
     local best_record = nil
     local best_score = -math.huge
     local best_tick = 0
+    local best_reason = ""
+    
+    local candidates = {}
     
     for _, rec in ipairs(data.backtrack_records) do
         if rec.valid and rec.tick_count then
             local tick_diff = current_tick - rec.tick_count
             if tick_diff > 0 and tick_diff <= max_ticks then
-                local dist = vec_distance(lx, ly, lz, rec.origin.x, rec.origin.y, rec.origin.z)
-                local score = 100 - tick_diff * 2 + math.max(0, 100 - dist/15)
-                
-                if rec.is_lc_break then score = score + 100 end
-                if rec.speed and rec.speed > 50 then score = score + 10 end
-                
-                if score > best_score then
-                    best_score = score
-                    best_record = rec
-                    best_tick = tick_diff
-                end
+                table.insert(candidates, {
+                    record = rec,
+                    tick_diff = tick_diff
+                })
             end
         end
     end
     
-    return best_record, best_tick, best_score
+    if #candidates == 0 then return nil, 0, 0, "no_candidates" end
+    
+    for _, cand in ipairs(candidates) do
+        local rec = cand.record
+        local tick_diff = cand.tick_diff
+        local score = 0
+        local reasons = {}
+        
+        -- === DISTANCE SCORING ===
+        local dist_to_origin = vec_distance(lx, ly, lz, rec.origin.x, rec.origin.y, rec.origin.z)
+        
+        -- Prefer closer targets (exponential decay)
+        local dist_score = math.max(0, 200 - dist_to_origin * 0.5)
+        score = score + dist_score
+        
+        if dist_to_origin < 200 then
+            table.insert(reasons, "close")
+        elseif dist_to_origin > 1500 then
+            score = score - 50
+            table.insert(reasons, "far")
+        end
+        
+        -- === TICK SCORING ===
+        -- Prefer fresher ticks but not too fresh
+        -- Sweet spot is around 8-15 ticks for exploit
+        if tick_diff <= 3 then
+            -- Too fresh, might be interpolated weirdly
+            score = score - 10
+        elseif tick_diff >= 8 and tick_diff <= 18 then
+            -- Sweet spot for backtrack exploit
+            score = score + 30
+            table.insert(reasons, "sweet_tick")
+        elseif tick_diff > 25 then
+            -- Getting old, less reliable
+            score = score - (tick_diff - 25) * 2
+        end
+        
+        -- === LC BREAK SCORING (HIGHEST PRIORITY) ===
+        if rec.is_lc_break then
+            score = score + 150
+            table.insert(reasons, "LC_BREAK")
+        end
+        
+        -- === VELOCITY SCORING ===
+        if rec.speed then
+            if rec.speed < 10 then
+                -- Stationary target - BEST
+                score = score + 80
+                table.insert(reasons, "stationary")
+            elseif rec.speed < 50 then
+                -- Slow moving - GOOD
+                score = score + 40
+                table.insert(reasons, "slow")
+            elseif rec.speed < 150 then
+                -- Medium speed - OK
+                score = score + 10
+            elseif rec.speed > 300 then
+                -- Very fast - hard to hit
+                score = score - 30
+                table.insert(reasons, "fast")
+            end
+        end
+        
+        -- === GROUND STATE SCORING ===
+        if rec.is_grounded then
+            score = score + 25
+            table.insert(reasons, "grounded")
+        else
+            -- In air - harder to predict
+            score = score - 20
+            table.insert(reasons, "air")
+        end
+        
+        -- === DUCK STATE SCORING ===
+        if rec.is_ducking then
+            -- Smaller target but also slower usually
+            score = score - 15
+        else
+            -- Standing - bigger hitbox
+            score = score + 15
+            table.insert(reasons, "standing")
+        end
+        
+        -- === ANGLE DELTA SCORING ===
+        if rec.angle_delta then
+            if rec.angle_delta > 30 then
+                -- High jitter/angle change - might be desync
+                score = score + 20
+                table.insert(reasons, "jitter")
+            elseif rec.angle_delta < 5 then
+                -- Stable angle - easier to hit
+                score = score + 15
+            end
+        end
+        
+        -- === HEAD POSITION CHECK ===
+        if rec.head and rec.head.x then
+            local head_dist = vec_distance(eye_x, eye_y, eye_z, rec.head.x, rec.head.y, rec.head.z)
+            
+            -- Prefer head positions that are hittable
+            if head_dist < 500 then
+                score = score + 25
+                table.insert(reasons, "head_close")
+            end
+        end
+        
+        -- === BODY AIM BONUS ===
+        if rec.chest and rec.chest.x then
+            local chest_dist = vec_distance(eye_x, eye_y, eye_z, rec.chest.x, rec.chest.y, rec.chest.z)
+            if chest_dist < dist_to_origin + 100 then
+                score = score + 15
+            end
+        end
+        
+        -- === PATTERN BONUS ===
+        -- If this tick was successful before
+        if data.best_tick_history then
+            for _, bt in ipairs(data.best_tick_history) do
+                if bt.tick_diff == tick_diff and bt.hit then
+                    score = score + 25
+                    table.insert(reasons, "past_hit")
+                    break
+                end
+            end
+        end
+        
+        -- === RANDOMIZATION (small) ===
+        -- Add tiny random factor to break ties
+        score = score + math.random() * 2
+        
+        if score > best_score then
+            best_score = score
+            best_record = rec
+            best_tick = tick_diff
+            best_reason = table.concat(reasons, ",")
+        end
+    end
+    
+    return best_record, best_tick, best_score, best_reason
 end
 
--- Analysis functions
+-- ============== ADVANCED RESOLVER ANALYSIS v19.0 ==============
+
+-- Jitter analysis with pattern detection
 local function analyze_jitter(data)
     if #data.angle_history < 5 then return end
     
     local changes = {}
     local oscillations = 0
     local last_dir = 0
+    local jitter_peaks = {}
+    local stable_count = 0
     
-    for i = #data.angle_history, math.max(1, #data.angle_history - 20), -1 do
+    for i = #data.angle_history, math.max(1, #data.angle_history - 30), -1 do
         if i > 1 and data.angle_history[i] and data.angle_history[i-1] then
             local diff = angle_diff(data.angle_history[i].angle, data.angle_history[i-1].angle)
             table.insert(changes, diff)
@@ -1735,33 +1935,62 @@ local function analyze_jitter(data)
             local dir = diff > 0 and 1 or -1
             if last_dir ~= 0 and dir ~= last_dir then
                 oscillations = oscillations + 1
+                if math.abs(diff) > 15 then
+                    table.insert(jitter_peaks, {idx = i, diff = diff, dir = last_dir})
+                end
             end
             last_dir = dir
+            
+            if math.abs(diff) < 3 then stable_count = stable_count + 1 end
         end
     end
     
     if #changes < 3 then return end
     
+    -- Calculate statistics
     local avg = 0
     for _, v in ipairs(changes) do avg = avg + math.abs(v) end
     avg = avg / #changes
     
     local var = 0
     for _, v in ipairs(changes) do var = var + (math.abs(v) - avg)^2 end
-    
     data.jitter_score = math.sqrt(var/#changes)
     data.avg_angle_change = avg
+    
+    -- Determine jitter type
     data.is_jitter = data.jitter_score > CONFIG.JITTER_THRESHOLD or oscillations > 4
+    data.jitter_oscillations = oscillations
+    data.stable_ratio = stable_count / #changes
+    
+    -- Predict jitter direction based on peaks
+    if #jitter_peaks >= 2 then
+        local last_peak = jitter_peaks[#jitter_peaks]
+        data.jitter_peak_dir = last_peak.dir
+        data.jitter_peak_diff = last_peak.diff
+    end
+    
+    -- Determine jitter pattern
+    if oscillations > 6 and avg > 20 then
+        data.jitter_type = "fast"
+    elseif oscillations > 3 and avg > 10 then
+        data.jitter_type = "normal"
+    elseif oscillations > 0 and avg < 10 then
+        data.jitter_type = "micro"
+    else
+        data.jitter_type = "none"
+    end
 end
 
+-- Spin analysis with direction prediction
 local function analyze_spin(data)
     if #data.angle_history < 6 then return false end
     
     local total = 0
     local samples = 0
     local votes = {left=0, right=0}
+    local recent_angles = {}
     
-    for i = #data.angle_history, math.max(1, #data.angle_history - 20), -1 do
+    for i = #data.angle_history, math.max(1, #data.angle_history - 25), -1 do
         if i > 1 and data.angle_history[i] and data.angle_history[i-1] then
             local diff = angle_diff(data.angle_history[i].angle, data.angle_history[i-1].angle)
             total = total + math.abs(diff)
@@ -1769,6 +1998,8 @@ local function analyze_spin(data)
             
             if diff > 0 then votes.right = votes.right + 1
             else votes.left = votes.left + 1 end
+            
+            table.insert(recent_angles, diff)
         end
     end
     
@@ -1778,114 +2009,513 @@ local function analyze_spin(data)
     data.spin_direction = votes.right > votes.left and 1 or -1
     data.is_spinning = data.spin_speed > CONFIG.SPIN_THRESHOLD
     
+    -- Calculate spin consistency
+    local consistent_count = 0
+    for _, diff in ipairs(recent_angles) do
+        if (diff > 0 and data.spin_direction > 0) or (diff < 0 and data.spin_direction < 0) then
+            consistent_count = consistent_count + 1
+        end
+    end
+    data.spin_consistency = consistent_count / #recent_angles
+    
+    -- Determine spin type
+    if data.spin_speed > 150 then
+        data.spin_type = "fast"
+    elseif data.spin_speed > 100 then
+        data.spin_type = "medium"
+    else
+        data.spin_type = "slow"
+    end
+    
     return data.is_spinning
 end
 
+-- Velocity analysis with movement prediction
 local function analyze_velocity(ent, data)
     local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
     local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
+    local vz = entity.get_prop(ent, "m_vecVelocity[2]") or 0
     local speed = math.sqrt(vx*vx + vy*vy)
     
-    table.insert(data.velocity_history, {speed = speed})
+    table.insert(data.velocity_history, {
+        speed = speed,
+        vx = vx,
+        vy = vy,
+        vz = vz,
+        time = globals.realtime()
+    })
     while #data.velocity_history > CONFIG.MAX_VELOCITY do
         table.remove(data.velocity_history, 1)
     end
     
     data.is_moving = speed > 10
     data.is_air = bit.band(entity.get_prop(ent, "m_fFlags") or 0, 1) == 0
+    data.current_speed = speed
     
+    -- Calculate velocity trend
+    if #data.velocity_history >= 3 then
+        local trend = 0
+        for i = #data.velocity_history - 2, #data.velocity_history - 1 do
+            if data.velocity_history[i+1] and data.velocity_history[i] then
+                trend = trend + (data.velocity_history[i+1].speed - data.velocity_history[i].speed)
+            end
+        end
+        data.velocity_trend = trend / 2
+    end
+    
+    -- Moving resolver - high confidence
     if speed > 35 then
         local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
         if eye_yaw then
-            local diff = angle_diff(math.deg(math.atan2(vy, vx)), eye_yaw)
-            if diff > 22 and diff < 158 then return SIDES.RIGHT, 0.78
-            elseif diff < -22 and diff > -158 then return SIDES.LEFT, 0.78 end
+            local move_yaw = math.deg(math.atan2(vy, vx))
+            local diff = angle_diff(move_yaw, eye_yaw)
+            
+            data.move_yaw_diff = diff
+            
+            -- More precise side detection
+            if diff > 25 and diff < 155 then
+                return SIDES.RIGHT, 0.85, "moving_right"
+            elseif diff < -25 and diff > -155 then
+                return SIDES.LEFT, 0.85, "moving_left"
+            elseif math.abs(diff) <= 25 then
+                -- Moving forward - center but with low confidence
+                return SIDES.CENTER, 0.5, "moving_forward"
+            elseif math.abs(diff) >= 155 then
+                -- Moving backward - could be fake
+                return SIDES.CENTER, 0.35, "moving_backward"
+            end
+        end
+    elseif speed > 5 and speed <= 35 then
+        -- Micro movement - might be counter-strafe
+        return SIDES.CENTER, 0.25, "micro_move"
+    end
+    
+    return SIDES.CENTER, 0.15, "stationary"
+end
+
+-- Enhanced memory analysis with hit rate
+local function analyze_memory(data)
+    if #data.successful_resolves < 2 then 
+        return SIDES.CENTER, 0, "no_memory"
+    end
+    
+    -- Weight recent hits more
+    local left_w, right_w, center_w, total_w = 0, 0, 0, 0
+    local recent_time = globals.realtime() - 30  -- Last 30 seconds
+    
+    for i = #data.successful_resolves, 1, -1 do
+        local res = data.successful_resolves[i]
+        if res.time and res.time > recent_time then
+            local time_weight = 1 + (res.time - recent_time) / 30  -- Newer = more weight
+            local weight = (res.confidence or 0.5) * time_weight
+            total_w = total_w + weight
+            
+            if res.side == SIDES.LEFT then left_w = left_w + weight
+            elseif res.side == SIDES.RIGHT then right_w = right_w + weight
+            else center_w = center_w + weight end
         end
     end
     
-    return SIDES.CENTER, 0.18
-end
-
-local function analyze_memory(data)
-    if #data.successful_resolves < 2 then return SIDES.CENTER, 0 end
-    
-    local left_w, right_w, total_w = 0, 0, 0
-    for _, res in ipairs(data.successful_resolves) do
-        local weight = res.confidence or 0.5
-        total_w = total_w + weight
-        
-        if res.side == SIDES.LEFT then left_w = left_w + weight
-        elseif res.side == SIDES.RIGHT then right_w = right_w + weight end
-    end
-    
-    if total_w < 0.25 then return SIDES.CENTER, 0 end
+    if total_w < 0.3 then return SIDES.CENTER, 0, "low_weight" end
     
     local left_ratio = left_w/total_w
     local right_ratio = right_w/total_w
+    local center_ratio = center_w/total_w
     
-    if left_ratio > 0.55 then return SIDES.LEFT, left_ratio * 0.92
-    elseif right_ratio > 0.55 then return SIDES.RIGHT, right_ratio * 0.92 end
+    data.memory_left_ratio = left_ratio
+    data.memory_right_ratio = right_ratio
     
-    return SIDES.CENTER, 0.18
+    -- High confidence if clear pattern
+    if left_ratio > 0.65 then 
+        return SIDES.LEFT, left_ratio * 0.95, "memory_left"
+    elseif right_ratio > 0.65 then 
+        return SIDES.RIGHT, right_ratio * 0.95, "memory_right"
+    elseif left_ratio > 0.55 then
+        return SIDES.LEFT, left_ratio * 0.75, "memory_left_weak"
+    elseif right_ratio > 0.55 then
+        return SIDES.RIGHT, right_ratio * 0.75, "memory_right_weak"
+    end
+    
+    return SIDES.CENTER, 0.2, "memory_uncertain"
 end
 
-local function analyze_animation(ent)
+-- Animation analysis with noise filtering
+local function analyze_animation(ent, data)
+    -- Get pose parameters
     local body_yaw = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_YAW)
-    if not body_yaw then return SIDES.CENTER, 0 end
+    local body_pitch = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_PITCH)
     
+    if not body_yaw then return SIDES.CENTER, 0, "no_anim" end
+    
+    -- Convert to degrees
     body_yaw = body_yaw * 360 - 180
     
-    if body_yaw > 30 then return SIDES.LEFT, 0.65
-    elseif body_yaw < -30 then return SIDES.RIGHT, 0.65 end
+    -- Store for averaging
+    if not data.body_yaw_history then data.body_yaw_history = {} end
+    table.insert(data.body_yaw_history, body_yaw)
+    while #data.body_yaw_history > 10 do table.remove(data.body_yaw_history, 1) end
     
-    return SIDES.CENTER, 0.2
+    -- Average to filter noise
+    local avg_body_yaw = 0
+    for _, v in ipairs(data.body_yaw_history) do avg_body_yaw = avg_body_yaw + v end
+    avg_body_yaw = avg_body_yaw / #data.body_yaw_history
+    
+    data.avg_body_yaw = avg_body_yaw
+    
+    -- High confidence for extreme values
+    if avg_body_yaw > 50 then 
+        return SIDES.LEFT, 0.85, "anim_left_strong"
+    elseif avg_body_yaw > 30 then 
+        return SIDES.LEFT, 0.70, "anim_left"
+    elseif avg_body_yaw < -50 then 
+        return SIDES.RIGHT, 0.85, "anim_right_strong"
+    elseif avg_body_yaw < -30 then 
+        return SIDES.RIGHT, 0.70, "anim_right"
+    elseif avg_body_yaw > 15 then
+        return SIDES.LEFT, 0.45, "anim_left_weak"
+    elseif avg_body_yaw < -15 then
+        return SIDES.RIGHT, 0.45, "anim_right_weak"
+    end
+    
+    return SIDES.CENTER, 0.2, "anim_center"
 end
 
-local function analyze_move_direction(ent, data)
-    if not data.velocity_history or #data.velocity_history < 3 then return SIDES.CENTER, 0 end
+-- Freestanding detection
+local function analyze_freestanding(ent, data)
+    local lx, ly, lz = entity.get_prop(entity.get_local_player(), "m_vecOrigin")
+    if not lx then return SIDES.CENTER, 0, "no_pos" end
     
-    local avg_speed = 0
-    for i = #data.velocity_history - 2, #data.velocity_history do
-        avg_speed = avg_speed + (data.velocity_history[i].speed or 0)
-    end
-    avg_speed = avg_speed / 3
+    local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+    if not ex then return SIDES.CENTER, 0, "no_enemy_pos" end
     
-    if avg_speed < 50 then return SIDES.CENTER, 0 end
+    -- Calculate angle to enemy
+    local dx, dy = ex - lx, ey - ly
+    local angle_to_enemy = math.deg(math.atan2(dy, dx))
     
     local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
-    if not eye_yaw then return SIDES.CENTER, 0 end
+    if not eye_yaw then return SIDES.CENTER, 0, "no_eye" end
     
-    local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
-    local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
-    local move_yaw = math.deg(math.atan2(vy, vx))
-    local diff = angle_diff(move_yaw, eye_yaw)
+    -- Check if enemy is looking at us
+    local look_diff = math.abs(angle_diff(angle_to_enemy, eye_yaw))
     
-    if math.abs(diff) > 150 then return SIDES.CENTER, 0.4 end
+    -- Enemy looking at us = potential freestanding
+    if look_diff < 30 then
+        data.is_freestanding = true
+        
+        -- Predict side based on our position relative to their view
+        local cross = dx * math.sin(eye_yaw * PI / 180) - dy * math.cos(eye_yaw * PI / 180)
+        
+        if cross > 50 then
+            return SIDES.RIGHT, 0.6, "freestand_right"
+        elseif cross < -50 then
+            return SIDES.LEFT, 0.6, "freestand_left"
+        end
+    else
+        data.is_freestanding = false
+    end
     
-    return SIDES.CENTER, 0
+    return SIDES.CENTER, 0, "no_freestand"
 end
 
-local function analyze_balance(ent, data)
-    local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
-    local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
-    local speed_2d = vec_length_2d(vx, vy)
+-- Fake duck detection
+local function analyze_fake_duck(ent, data)
+    local duck = entity.get_prop(ent, "m_flDuckAmount") or 0
+    local flags = entity.get_prop(ent, "m_fFlags") or 0
+    local is_ducking = bit.band(flags, 2) ~= 0
     
-    if data.velocity_history and #data.velocity_history >= 2 then
-        local prev_speed = data.velocity_history[#data.velocity_history - 1].speed or 0
-        if prev_speed and prev_speed > 5 then
-            local speed_diff = math.abs(speed_2d - prev_speed) / prev_speed
-            if speed_diff > 0.3 then return SIDES.CENTER, 0.3 end
+    -- Store duck history
+    if not data.duck_history then data.duck_history = {} end
+    table.insert(data.duck_history, duck)
+    while #data.duck_history > 20 do table.remove(data.duck_history, 1) end
+    
+    -- Detect fake duck pattern
+    if #data.duck_history >= 10 then
+        local variance = 0
+        local avg = 0
+        for _, v in ipairs(data.duck_history) do avg = avg + v end
+        avg = avg / #data.duck_history
+        
+        for _, v in ipairs(data.duck_history) do
+            variance = variance + (v - avg) * (v - avg)
+        end
+        variance = variance / #data.duck_history
+        
+        -- High variance = fake duck
+        if variance > 0.1 and avg > 0.2 and avg < 0.8 then
+            data.is_fake_duck = true
+            data.fake_duck_phase = avg > 0.5 and "up" or "down"
+            return true
         end
     end
     
-    return SIDES.CENTER, 0
+    data.is_fake_duck = false
+    return false
 end
 
+-- Miss learning - predict opposite after miss
+local function analyze_miss_learning(data)
+    if not data.opposite_from_miss then 
+        return SIDES.CENTER, 0, "no_miss_learn"
+    end
+    
+    local time_since_miss = globals.realtime() - (data.miss_learn_time or 0)
+    
+    -- Decay over time
+    if time_since_miss > 3 then
+        data.opposite_from_miss = nil
+        return SIDES.CENTER, 0, "miss_learn_expired"
+    end
+    
+    local confidence = 0.7 * (1 - time_since_miss / 3)
+    
+    if data.opposite_from_miss > 0 then
+        return SIDES.LEFT, confidence, "miss_opp_left"
+    else
+        return SIDES.RIGHT, confidence, "miss_opp_right"
+    end
+end
+
+-- Bruteforce after consecutive misses
+local function analyze_bruteforce(data)
+    if data.consecutive_misses < 1 then
+        return SIDES.CENTER, 0, "no_bf"
+    end
+    
+    -- Bruteforce stages
+    local bf_stage = math.min(data.consecutive_misses, 4)
+    data.bf_stage = bf_stage
+    
+    -- Different angle for each miss
+    local bf_angles = {
+        [1] = {side = SIDES.LEFT, conf = 0.5},   -- First miss: try left
+        [2] = {side = SIDES.RIGHT, conf = 0.55}, -- Second miss: try right
+        [3] = {side = SIDES.LEFT, conf = 0.6},   -- Third miss: try left extended
+        [4] = {side = SIDES.RIGHT, conf = 0.65}, -- Fourth miss: try right extended
+    }
+    
+    local bf = bf_angles[bf_stage]
+    return bf.side, bf.conf, "bf_stage_" .. bf_stage
+end
+
+-- Pattern recognition
 local function recognize_pattern(data)
-    if data.is_spinning then return "spin", 0.90 end
-    if data.is_jitter then return "jitter", 0.85 end
-    if data.is_extended then return "extended", 0.82 end
-    return "unknown", 0.25
+    -- Check for specific patterns
+    if data.is_spinning then
+        return "spin", 0.90, data.spin_direction * -1
+    end
+    
+    if data.is_jitter then
+        if data.jitter_type == "fast" then
+            -- Fast jitter - predict opposite of last peak
+            return "fast_jitter", 0.80, (data.jitter_peak_dir or 1) * -1
+        elseif data.jitter_type == "normal" then
+            return "jitter", 0.75, (data.jitter_peak_dir or 1) * -1
+        else
+            return "micro_jitter", 0.60, SIDES.LEFT
+        end
+    end
+    
+    if data.is_fake_duck then
+        return "fake_duck", 0.70, SIDES.CENTER
+    end
+    
+    if data.is_freestanding then
+        return "freestanding", 0.65, SIDES.CENTER
+    end
+    
+    return "unknown", 0.25, SIDES.CENTER
+end
+
+-- ============== MAIN PREDICTION ==============
+
+-- Main prediction function with advanced weighting
+local function get_prediction(ent)
+    local data = get_data(ent)
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+    
+    if not eye_yaw then return 60, 0.35 end
+    
+    local predictions = {}
+    
+    -- === CLOUD DATA (highest priority if available) ===
+    if ui.get(ui_elements.cloud_enabled) then
+        local cloud_data = cloud_resolver.get_data(ent)
+        if cloud_data and cloud_data.confidence >= CONFIG.CLOUD_MIN_CONFIDENCE then
+            local cloud_weight = CONFIG.CLOUD_WEIGHT
+            if cloud_data.reporter_count and cloud_data.reporter_count > 1 then
+                cloud_weight = cloud_weight * (1 + cloud_data.reporter_count * CLOUD_CONFIG.CLOUD_WEIGHT_MULTIPLIER)
+            end
+            table.insert(predictions, {
+                side = cloud_data.angle > 0 and SIDES.LEFT or SIDES.RIGHT,
+                conf = cloud_data.confidence,
+                weight = cloud_weight,
+                source = "cloud",
+                angle = cloud_data.angle
+            })
+            data.cloud_used = cloud_data.source == "cloud"
+        end
+    end
+    
+    -- === MOVING RESOLVER (very reliable when moving) ===
+    local v_side, v_conf, v_reason = analyze_velocity(ent, data)
+    if v_conf > 0.3 then
+        table.insert(predictions, {
+            side = v_side,
+            conf = v_conf,
+            weight = 2.0 * CONFIG.WEIGHT_VELOCITY,
+            source = "velocity",
+            reason = v_reason
+        })
+    end
+    
+    -- === MEMORY (based on past successful hits) ===
+    local m_side, m_conf, m_reason = analyze_memory(data)
+    if m_conf > 0.35 then
+        table.insert(predictions, {
+            side = m_side,
+            conf = m_conf,
+            weight = 2.2 * CONFIG.WEIGHT_MEMORY,
+            source = "memory",
+            reason = m_reason
+        })
+    end
+    
+    -- === ANIMATION (body yaw from pose parameters) ===
+    local a_side, a_conf, a_reason = analyze_animation(ent, data)
+    if a_conf > 0.3 then
+        table.insert(predictions, {
+            side = a_side,
+            conf = a_conf,
+            weight = 1.8 * CONFIG.WEIGHT_ANIMATION,
+            source = "animation",
+            reason = a_reason
+        })
+    end
+    
+    -- === PATTERN RECOGNITION ===
+    local pattern, p_conf, p_side = recognize_pattern(data)
+    if p_conf > 0.4 then
+        table.insert(predictions, {
+            side = p_side,
+            conf = p_conf,
+            weight = 2.0 * CONFIG.WEIGHT_PATTERN,
+            source = "pattern",
+            pattern = pattern
+        })
+    end
+    
+    -- === FREESTANDING DETECTION ===
+    local f_side, f_conf, f_reason = analyze_freestanding(ent, data)
+    if f_conf > 0.35 then
+        table.insert(predictions, {
+            side = f_side,
+            conf = f_conf,
+            weight = 1.5,
+            source = "freestanding",
+            reason = f_reason
+        })
+    end
+    
+    -- === MISS LEARNING (opposite of last miss) ===
+    local ml_side, ml_conf, ml_reason = analyze_miss_learning(data)
+    if ml_conf > 0.35 then
+        table.insert(predictions, {
+            side = ml_side,
+            conf = ml_conf,
+            weight = 2.5,  -- High weight after miss
+            source = "miss_learning",
+            reason = ml_reason
+        })
+    end
+    
+    -- === BRUTEFORCE (after consecutive misses) ===
+    if data.consecutive_misses >= 1 then
+        local bf_side, bf_conf, bf_reason = analyze_bruteforce(data)
+        if bf_conf > 0.35 then
+            table.insert(predictions, {
+                side = bf_side,
+                conf = bf_conf,
+                weight = 2.8,  -- Even higher for bruteforce
+                source = "bruteforce",
+                reason = bf_reason
+            })
+        end
+    end
+    
+    -- === DT DETECTION ===
+    if data.dt_detected and data.dt_confidence > 0.5 then
+        table.insert(predictions, {
+            side = data.dt_angle_offset > 0 and SIDES.LEFT or SIDES.RIGHT,
+            conf = data.dt_confidence * 0.8,
+            weight = CONFIG.WEIGHT_DT,
+            source = "dt"
+        })
+    end
+    
+    -- === CALCULATE FINAL PREDICTION ===
+    if #predictions == 0 then return 60, 0.35 end
+    
+    -- Sort by weight * confidence
+    table.sort(predictions, function(a, b)
+        return (a.weight * a.conf) > (b.weight * b.conf)
+    end)
+    
+    -- Calculate weighted average
+    local total_w = 0
+    local weighted_side = 0
+    local top_source = predictions[1].source
+    
+    for _, pred in ipairs(predictions) do
+        local w = pred.weight * pred.conf
+        weighted_side = weighted_side + (pred.side * w)
+        total_w = total_w + w
+    end
+    
+    local final_side = total_w > 0 and weighted_side / total_w or 0
+    local final_conf = total_w > 0 and total_w / #predictions or 0.35
+    
+    -- Determine final side
+    if final_side > 0.2 then 
+        final_side = SIDES.LEFT
+    elseif final_side < -0.2 then 
+        final_side = SIDES.RIGHT
+    else 
+        final_side = SIDES.CENTER
+    end
+    
+    -- Calculate angle based on aggression and pattern
+    local base_angle = 58
+    local aggression_mult = ui.get(ui_elements.aggression) / 5
+    
+    -- Adjust angle based on pattern
+    if pattern == "spin" then
+        base_angle = 58 + data.spin_speed * 0.3
+    elseif pattern == "fast_jitter" then
+        base_angle = 50 + (data.jitter_peak_diff or 30) * 0.5
+    elseif pattern == "jitter" then
+        base_angle = 55
+    elseif data.is_fake_duck then
+        base_angle = 45  -- Smaller angle for fake duck
+    end
+    
+    local angle = final_side * base_angle * final_conf * aggression_mult
+    angle = clamp(angle, -165, 165)
+    
+    data.predicted_side = final_side
+    data.confidence = final_conf
+    data.top_source = top_source
+    data.detected_pattern = pattern
+    
+    return angle, final_conf, top_source
+end
+
+-- Apply resolve
+local function apply_resolve(ent, angle)
+    if not entity.is_alive(ent) then return end
+    local data = get_data(ent)
+    if globals.realtime() - data.last_plist_update < CONFIG.SAMPLE_RATE then return end
+    data.last_plist_update = globals.realtime()
+    plist_set_force_angle(ent, angle)
 end
 
 -- DT detection
@@ -1917,192 +2547,12 @@ local function detect_doubletap(ent, data)
     data.last_ammo = ammo
 end
 
--- Adaptive weight
-local function get_adaptive_weight(source, data)
-    local base_weight = 1.5
-    
-    if source == "memory" then
-        if data.consecutive_hits > 2 then
-            base_weight = base_weight * (1 + data.consecutive_hits * 0.1)
-        end
-        if data.consecutive_misses > 1 then
-            base_weight = base_weight * (1 - data.consecutive_misses * 0.15)
-        end
-    elseif source == "velocity" then
-        if data.velocity_history and #data.velocity_history >= 3 then
-            local avg = 0
-            for i = #data.velocity_history - 2, #data.velocity_history do
-                avg = avg + (data.velocity_history[i].speed or 0)
-            end
-            avg = avg / 3
-            if avg > 100 then base_weight = base_weight * 1.1 end
-        end
-    end
-    
-    return base_weight
-end
-
--- Miss learning
+-- Learn from miss
 local function learn_from_miss(data)
-    if #data.successful_resolves < 1 then return end
-    
     if data.last_resolve then
         data.opposite_from_miss = -data.last_resolve
         data.miss_learn_time = globals.realtime()
     end
-end
-
--- Main prediction
-local function get_prediction(ent)
-    local data = get_data(ent)
-    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
-    
-    if not eye_yaw then return 60, 0.35 end
-    
-    local predictions = {}
-    
-    -- Cloud data first
-    if ui.get(ui_elements.cloud_enabled) then
-        local cloud_data = cloud_resolver.get_data(ent)
-        if cloud_data and cloud_data.confidence >= CONFIG.CLOUD_MIN_CONFIDENCE then
-            local cloud_weight = CONFIG.CLOUD_WEIGHT
-            if cloud_data.reporter_count and cloud_data.reporter_count > 1 then
-                cloud_weight = cloud_weight * (1 + cloud_data.reporter_count * CLOUD_CONFIG.CLOUD_WEIGHT_MULTIPLIER)
-            end
-            table.insert(predictions, {
-                side = cloud_data.angle > 0 and SIDES.LEFT or SIDES.RIGHT,
-                conf = cloud_data.confidence,
-                weight = cloud_weight,
-                source = "cloud"
-            })
-            data.cloud_used = cloud_data.source == "cloud"
-        end
-    end
-    
-    -- Miss learning
-    if data.opposite_from_miss and globals.realtime() - data.miss_learn_time < 2 then
-        table.insert(predictions, {
-            side = data.opposite_from_miss > 0 and SIDES.LEFT or SIDES.RIGHT,
-            conf = 0.6,
-            weight = 1.8,
-            source = "miss_learning"
-        })
-    end
-    
-    -- Velocity
-    local v_side, v_conf = analyze_velocity(ent, data)
-    if v_conf > 0.25 then
-        table.insert(predictions, {
-            side = v_side,
-            conf = v_conf,
-            weight = get_adaptive_weight("velocity", data) * CONFIG.WEIGHT_VELOCITY,
-            source = "velocity"
-        })
-    end
-    
-    -- Pattern
-    local pattern, p_conf = recognize_pattern(data)
-    if p_conf > 0.25 then
-        local side = SIDES.CENTER
-        if pattern == "spin" then side = data.spin_direction * -1
-        elseif pattern == "jitter" then side = (data.predicted_side ~= 0 and data.predicted_side or SIDES.LEFT) * -1 end
-        
-        table.insert(predictions, {
-            side = side,
-            conf = p_conf,
-            weight = get_adaptive_weight("pattern", data) * CONFIG.WEIGHT_PATTERN,
-            source = "pattern"
-        })
-    end
-    
-    -- Memory
-    local m_side, m_conf = analyze_memory(data)
-    if m_conf > 0.30 then
-        table.insert(predictions, {
-            side = m_side,
-            conf = m_conf,
-            weight = get_adaptive_weight("memory", data) * CONFIG.WEIGHT_MEMORY,
-            source = "memory"
-        })
-    end
-    
-    -- Animation
-    local a_side, a_conf = analyze_animation(ent)
-    if a_conf > 0.25 then
-        table.insert(predictions, {
-            side = a_side,
-            conf = a_conf,
-            weight = get_adaptive_weight("animation", data) * CONFIG.WEIGHT_ANIMATION,
-            source = "animation"
-        })
-    end
-    
-    -- Move direction
-    local md_side, md_conf = analyze_move_direction(ent, data)
-    if md_conf > 0.25 then
-        table.insert(predictions, {
-            side = md_side,
-            conf = md_conf,
-            weight = CONFIG.WEIGHT_MOVE_DIR,
-            source = "move_dir"
-        })
-    end
-    
-    -- Balance
-    local b_side, b_conf = analyze_balance(ent, data)
-    if b_conf > 0.25 then
-        table.insert(predictions, {
-            side = b_side,
-            conf = b_conf,
-            weight = CONFIG.WEIGHT_BALANCE,
-            source = "balance"
-        })
-    end
-    
-    -- DT
-    if data.dt_detected and data.dt_confidence > 0.5 then
-        table.insert(predictions, {
-            side = data.dt_angle_offset > 0 and SIDES.LEFT or SIDES.RIGHT,
-            conf = data.dt_confidence * 0.8,
-            weight = CONFIG.WEIGHT_DT,
-            source = "dt"
-        })
-    end
-    
-    if #predictions == 0 then return 60, 0.35 end
-    
-    -- Calculate weighted average
-    local total_w = 0
-    local weighted_side = 0
-    
-    for _, pred in ipairs(predictions) do
-        weighted_side = weighted_side + (pred.side * pred.conf * pred.weight)
-        total_w = total_w + (pred.conf * pred.weight)
-    end
-    
-    local final_side = total_w > 0 and weighted_side / total_w or 0
-    local final_conf = total_w > 0 and total_w / #predictions or 0.35
-    
-    if final_side > 0.18 then final_side = SIDES.LEFT
-    elseif final_side < -0.18 then final_side = SIDES.RIGHT
-    else final_side = SIDES.CENTER end
-    
-    local angle = final_side * CONFIG.EXTENDED_DESYNC_MAX * final_conf * (ui.get(ui_elements.aggression) / 5)
-    angle = clamp(angle, -165, 165)
-    
-    data.predicted_side = final_side
-    data.confidence = final_conf
-    
-    return angle, final_conf
-end
-
--- Apply resolve
-local function apply_resolve(ent, angle)
-    if not entity.is_alive(ent) then return end
-    local data = get_data(ent)
-    if globals.realtime() - data.last_plist_update < CONFIG.SAMPLE_RATE then return end
-    data.last_plist_update = globals.realtime()
-    plist_set_force_angle(ent, angle)
 end
 
 -- Main resolver
@@ -2117,40 +2567,40 @@ local function resolve(ent)
     table.insert(data.angle_history, {angle = eye_yaw, time = globals.realtime()})
     while #data.angle_history > CONFIG.MAX_HISTORY do table.remove(data.angle_history, 1) end
     
+    -- Run all analysis
     analyze_jitter(data)
     analyze_spin(data)
+    analyze_fake_duck(ent, data)
     detect_doubletap(ent, data)
     record_backtrack(ent, data)
     
-    local angle, conf = 60, 0.35
-    local mode = ui.get(ui_elements.mode)
+    local angle, conf, source = get_prediction(ent)
     
+    -- Mode handling
+    local mode = ui.get(ui_elements.mode)
     if mode == "Cloud Priority" or mode == "Cloud Aggressive" then
         if ui.get(ui_elements.cloud_enabled) then
             local cloud_data = cloud_resolver.get_data(ent)
-            if cloud_data and cloud_data.confidence >= (mode == "Cloud Aggressive" and 0.4 or 0.5) then
+            local threshold = mode == "Cloud Aggressive" and 0.4 or 0.5
+            if cloud_data and cloud_data.confidence >= threshold then
                 angle = cloud_data.angle
                 conf = cloud_data.confidence
-                data.cloud_used = cloud_data.source == "cloud"
+                data.cloud_used = true
+                source = "cloud"
                 global_stats.cloud_resolves = global_stats.cloud_resolves + 1
                 if cloud_data.reporter_count and cloud_data.reporter_count > 1 then
                     global_stats.cloud_multi_reporter = global_stats.cloud_multi_reporter + 1
                 end
-            else
-                angle, conf = get_prediction(ent)
             end
-        else
-            angle, conf = get_prediction(ent)
         end
-    else
-        angle, conf = get_prediction(ent)
     end
     
     angle = clamp(tonumber(angle) or 60, -165, 165)
     conf = clamp(tonumber(conf) or 0.35, 0, 1)
     
     data.last_resolve = angle
-    data.detected_pattern = recognize_pattern(data)
+    data.resolve_source = source
+    
     apply_resolve(ent, angle)
     global_stats.total_resolves = global_stats.total_resolves + 1
     
@@ -2158,6 +2608,9 @@ local function resolve(ent)
 end
 
 -- Events
+local current_target = nil
+local best_bt_tick = 0
+
 client.set_event_callback("setup_command", function(cmd)
     if not ui.get(ui_elements.enabled) then return end
     local lp = entity.get_local_player()
@@ -2174,8 +2627,44 @@ client.set_event_callback("setup_command", function(cmd)
     
     local players = entity.get_players(true)
     if not players then return end
+    
+    -- Find closest enemy for backtrack targeting
+    local closest_ent = nil
+    local closest_dist = math.huge
+    local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+    
     for _, ent in ipairs(players) do
-        if entity.is_alive(ent) then resolve(ent) end
+        if entity.is_alive(ent) then
+            resolve(ent)
+            
+            local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+            if ex then
+                local dist = vec_distance(lx, ly, lz, ex, ey, ez)
+                if dist < closest_dist then
+                    closest_dist = dist
+                    closest_ent = ent
+                end
+            end
+        end
+    end
+    
+    -- Apply backtrack when attacking
+    if closest_ent and cmd.in_attack == 1 then
+        local data = get_data(closest_ent)
+        local record, tick_diff, score, reason = get_best_backtrack_record(closest_ent, data)
+        
+        if record and tick_diff > 0 and tick_diff <= ui.get(ui_elements.bt_ticks) then
+            current_target = closest_ent
+            best_bt_tick = record.tick_count
+            cmd.tickcount = best_bt_tick
+            data.backtrack_is_valid = true
+            data.best_bt_tick = best_bt_tick
+            
+            if CLOUD_CONFIG.DEBUG then
+                client.log(string.format("[BT] T:%d | Tick:%d | Diff:%d | Score:%.1f | %s", 
+                    closest_ent, best_bt_tick, tick_diff, score, reason))
+            end
+        end
     end
 end)
 
@@ -2188,16 +2677,18 @@ client.set_event_callback("aim_fire", function(e)
     data.shots = data.shots + 1
     global_stats.shots = global_stats.shots + 1
     
-    -- Find best backtrack record for logging
-    local record, tick_diff = get_best_backtrack_record(ent, data)
-    if record then
-        data.backtrack_is_valid = true
-        data.best_bt_tick = record.tick_count
+    -- Check if backtrack was applied
+    if data.backtrack_is_valid and data.best_bt_tick then
         global_stats.backtrack_shots = global_stats.backtrack_shots + 1
-    end
-    
-    if ui.get(ui_elements.log_hits) then
-        client.log(string.format("[FIRE] T:%d | BT:%d%s", ent, tick_diff or 0, data.cloud_used and " [CLOUD]" or ""))
+        if ui.get(ui_elements.log_hits) then
+            local tick_diff = globals.tickcount() - data.best_bt_tick
+            client.log(string.format("[FIRE] T:%d | BT tick:%d | Diff:%d%s", 
+                ent, data.best_bt_tick, tick_diff, data.cloud_used and " [CLOUD]" or ""))
+        end
+    else
+        if ui.get(ui_elements.log_hits) then
+            client.log(string.format("[FIRE] T:%d | No BT%s", ent, data.cloud_used and " [CLOUD]" or ""))
+        end
     end
 end)
 
@@ -2214,7 +2705,20 @@ client.set_event_callback("aim_hit", function(e)
     global_stats.streak_current = global_stats.streak_current + 1
     global_stats.streak_best = math.max(global_stats.streak_best, global_stats.streak_current)
     
-    if data.backtrack_is_valid then global_stats.backtrack_hits = global_stats.backtrack_hits + 1 end
+    -- Mark backtrack hit
+    if data.backtrack_is_valid and data.best_bt_tick then
+        global_stats.backtrack_hits = global_stats.backtrack_hits + 1
+        
+        -- Mark this tick diff as successful for pattern learning
+        local tick_diff = globals.tickcount() - data.best_bt_tick
+        for _, bt in ipairs(data.best_tick_history) do
+            if bt.tick_count == data.best_bt_tick then
+                bt.hit = true
+                break
+            end
+        end
+    end
+    
     if data.cloud_used then global_stats.cloud_hits = global_stats.cloud_hits + 1 end
     
     table.insert(data.successful_resolves, {
@@ -2235,10 +2739,17 @@ client.set_event_callback("aim_hit", function(e)
     end
     
     if ui.get(ui_elements.log_hits) then
-        client.log(string.format("[HIT] T:%d | Streak:%d | Angle:%.1f%s", ent, data.consecutive_hits, data.last_resolve, data.cloud_used and " [CLOUD]" or ""))
+        local bt_info = ""
+        if data.backtrack_is_valid and data.best_bt_tick > 0 then
+            local tick_diff = globals.tickcount() - data.best_bt_tick
+            bt_info = string.format(" | BT:%d ticks", tick_diff)
+        end
+        client.log(string.format("[HIT] T:%d | Streak:%d | Angle:%.1f%s%s", 
+            ent, data.consecutive_hits, data.last_resolve, bt_info, data.cloud_used and " [CLOUD]" or ""))
     end
     
     data.backtrack_is_valid = false
+    data.best_bt_tick = 0
     data.cloud_used = false
 end)
 
@@ -2252,7 +2763,7 @@ client.set_event_callback("aim_miss", function(e)
     
     local data = get_data(ent)
     data.misses = data.misses + 1
-    data.consecutive_misses = data.misses + 1
+    data.consecutive_misses = data.consecutive_misses + 1
     data.consecutive_hits = 0
     global_stats.misses = global_stats.misses + 1
     global_stats.streak_current = 0
@@ -2272,6 +2783,7 @@ client.set_event_callback("aim_miss", function(e)
     end
     
     data.backtrack_is_valid = false
+    data.best_bt_tick = 0
 end)
 
 client.set_event_callback("paint", function()
