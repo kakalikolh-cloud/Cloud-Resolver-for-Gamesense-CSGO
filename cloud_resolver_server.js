@@ -2,6 +2,7 @@
  * Cloud Resolver Server v1.0
  * 
  * Lightweight HTTP server for sharing resolver data between teammates
+ * Works on Render.com, Railway.app, Heroku, and local server
  * 
  * Features:
  * - SteamID-based player tracking
@@ -22,12 +23,13 @@
 const http = require('http');
 const url = require('url');
 
-// Configuration
+// Configuration - Render uses PORT environment variable
 const CONFIG = {
-    PORT: 3000,
-    DATA_EXPIRATION: 60000,      // 60 seconds
-    CLEANUP_INTERVAL: 30000,     // 30 seconds
-    MAX_ENTRIES: 1000,           // Maximum stored entries
+    PORT: process.env.PORT || 3000,  // Render sets PORT automatically
+    HOST: '0.0.0.0',                 // Must be 0.0.0.0 for Render
+    DATA_EXPIRATION: 60000,          // 60 seconds
+    CLEANUP_INTERVAL: 30000,         // 30 seconds
+    MAX_ENTRIES: 1000,               // Maximum stored entries
     DEBUG: true
 };
 
@@ -245,15 +247,22 @@ const server = http.createServer((req, res) => {
         return;
     }
     
+    // Health check for Render
+    if (pathname === '/health' || pathname === '/healthz') {
+        sendJSON(res, 200, { status: 'healthy' });
+        return;
+    }
+    
     // Default: 404
     sendError(res, 404, 'Not found');
 });
 
-// Start server
-server.listen(CONFIG.PORT, () => {
+// Start server - Render requires listening on 0.0.0.0
+server.listen(CONFIG.PORT, CONFIG.HOST, () => {
     console.log('╔════════════════════════════════════════════╗');
     console.log('║     Cloud Resolver Server v1.0             ║');
     console.log('╠════════════════════════════════════════════╣');
+    console.log(`║  Host: ${CONFIG.HOST}`);
     console.log(`║  Port: ${CONFIG.PORT}`);
     console.log(`║  Data Expiration: ${CONFIG.DATA_EXPIRATION / 1000}s`);
     console.log(`║  Max Entries: ${CONFIG.MAX_ENTRIES}`);
@@ -264,6 +273,7 @@ server.listen(CONFIG.PORT, () => {
     console.log('║  POST /api/resolver/update  - Send data    ║');
     console.log('║  POST /api/resolver/clear   - Clear data   ║');
     console.log('║  GET  /api/resolver/player/:steam64        ║');
+    console.log('║  GET  /health               - Health check ║');
     console.log('╚════════════════════════════════════════════╝');
     console.log('');
     log('Server started');
