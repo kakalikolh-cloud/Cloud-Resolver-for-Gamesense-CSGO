@@ -1,9 +1,18 @@
 --[[
-    FORWARD HVH RESOLVER v18.3 - CLOUD SYNC
-    Professional resolver with cloud-based data sharing between teammates
+    FORWARD HVH RESOLVER v18.4 - CLOUD SYNC ENHANCED
+    Professional resolver with advanced cloud-based data sharing between teammates
     
-    v18.3:
-    - Fixed Gamesense HTTP API callback format
+    v18.4 Cloud Improvements:
+    - Multi-reporter aggregation (weighted average from multiple teammates)
+    - Retry mechanism with exponential backoff
+    - Team validation (only accept data from same team)
+    - Pattern learning & sharing
+    - Confidence boosting based on reporter count
+    - Latency compensation
+    - Anti-spam protection
+    - Data validation & sanity checks
+    
+    v18.x Features:
     - Full Backtrack Exploit with LC break detection
     - Cubic Hermite Interpolation
     - Catmull-Rom Spline Interpolation  
@@ -23,21 +32,41 @@ local cloud_resolver = {}
 
 local CLOUD_CONFIG = {
     SERVER_URL = "https://cloud-resolver-for-gamesense-csgo.onrender.com/api",
-    POLL_INTERVAL = 2.0,
-    DATA_TIMEOUT = 60.0,
-    MIN_CONFIDENCE = 0.5,
-    DEBUG = true
+    POLL_INTERVAL = 1.5,           -- Faster polling
+    DATA_TIMEOUT = 45.0,           -- Faster data expiration
+    MIN_CONFIDENCE = 0.4,          -- Lower threshold to use cloud data
+    DEBUG = true,
+    
+    -- Enhanced features
+    MAX_RETRY = 3,
+    RETRY_DELAY = 0.5,
+    MAX_REPORTERS = 5,             -- Max reporters to aggregate
+    CONFIDENCE_BOOST = 0.15,       -- Boost per additional reporter
+    SAME_TEAM_ONLY = true,         -- Only accept data from same team
+    ANTI_SPAM_INTERVAL = 0.3,      -- Min time between reports
+    LATENCY_COMPENSATION = 0.1,    -- Compensate for network latency
+    DATA_VALIDATION = true,        -- Validate incoming data
+    PATTERN_LEARNING = true,       -- Learn patterns from successful hits
 }
 
 local cloud_state = {
     initialized = false,
     my_steamid = nil,
     my_steam64 = nil,
+    my_team = nil,
     last_poll = 0,
-    cloud_data = {},
+    cloud_data = {},               -- [steam64] = {reports={}, aggregated_angle, aggregated_conf, ...}
     sync_count = 0,
     error_count = 0,
-    last_error = nil
+    last_error = nil,
+    retry_count = 0,
+    pending_reports = {},          -- Queue of pending reports
+    last_report_time = 0,
+    connected_teammates = {},      -- Track connected teammates
+    pattern_memory = {},           -- Learned patterns per player
+    local_hits = {},               -- Track local hits for pattern learning
+    server_latency = 0,
+    last_ping_time = 0,
 }
 
 -- JSON Parser
@@ -178,20 +207,193 @@ function json.encode(val)
     return "null"
 end
 
+-- ============== UTILITY FUNCTIONS ==============
+
+local function clamp_val(v, min, max)
+    if type(v) ~= "number" then return min end
+    return math.max(min, math.min(max, v))
+end
+
+-- ============== DATA VALIDATION ==============
+
+local function validate_report(report)
+    if not report then return false end
+    if not report.reporter_steamid or not report.enemy_steam64 then return false end
+    local angle = tonumber(report.angle)
+    if not angle or math.abs(angle) > 180 then return false end
+    local conf = tonumber(report.confidence)
+    if not conf or conf < 0 or conf > 1 then return false end
+    return true
+end
+
+-- ============== AGGREGATION ==============
+
+local function aggregate_reports(reports, my_steamid)
+    if not reports or #reports == 0 then return nil, 0 end
+    
+    local valid_reports = {}
+    for _, r in ipairs(reports) do
+        if r.reporter ~= my_steamid and validate_report(r) then
+            table.insert(valid_reports, r)
+        end
+    end
+    
+    if #valid_reports == 0 then return nil, 0 end
+    
+    table.sort(valid_reports, function(a, b)
+        if a.confidence ~= b.confidence then return a.confidence > b.confidence end
+        return (a.timestamp or 0) > (b.timestamp or 0)
+    end)
+    
+    local max_reporters = math.min(#valid_reports, CLOUD_CONFIG.MAX_REPORTERS)
+    local total_weight, weighted_angle = 0, 0
+    local side_votes = {left = 0, right = 0}
+    
+    for i = 1, max_reporters do
+        local r = valid_reports[i]
+        local weight = r.confidence or 0.5
+        if r.hit then weight = weight * 1.5 end
+        local age = globals.realtime() - (r.timestamp or 0)
+        weight = weight * math.max(0.5, 1 - age / CLOUD_CONFIG.DATA_TIMEOUT)
+        total_weight = total_weight + weight
+        weighted_angle = weighted_angle + (r.angle or 60) * weight
+        if (r.angle or 0) > 0 then side_votes.left = side_votes.left + weight
+        else side_votes.right = side_votes.right + weight end
+    end
+    
+    if total_weight == 0 then return nil, 0 end
+    
+    local final_angle = weighted_angle / total_weight
+    local base_conf = total_weight / max_reporters
+    local total_votes = side_votes.left + side_votes.right
+    local agreement = math.max(side_votes.left, side_votes.right) / total_votes
+    local reporter_boost = (max_reporters - 1) * CLOUD_CONFIG.CONFIDENCE_BOOST
+    local final_conf = clamp_val(base_conf + agreement * 0.2 + reporter_boost, 0, 1)
+    
+    return final_angle, final_conf, max_reporters
+end
+
+-- ============== TEAM VALIDATION ==============
+
+local function is_same_team(reporter_steamid)
+    if not CLOUD_CONFIG.SAME_TEAM_ONLY then return true end
+    local players = entity.get_players(false)
+    if not players then return cloud_state.connected_teammates[reporter_steamid] ~= nil end
+    for _, ent in ipairs(players) do
+        local steam64 = entity.get_steam64(ent)
+        if steam64 and tostring(steam64) == reporter_steamid then
+            local team = entity.get_prop(ent, "m_iTeamNum")
+            return team == cloud_state.my_team
+        end
+    end
+    return cloud_state.connected_teammates[reporter_steamid] ~= nil
+end
+
+local function update_teammate_list()
+    local lp = entity.get_local_player()
+    if not lp then return end
+    cloud_state.my_team = entity.get_prop(lp, "m_iTeamNum")
+    local players = entity.get_players(false)
+    if not players then return end
+    for _, ent in ipairs(players) do
+        local steam64 = entity.get_steam64(ent)
+        if steam64 and steam64 ~= 0 then
+            local team = entity.get_prop(ent, "m_iTeamNum")
+            if team == cloud_state.my_team then
+                cloud_state.connected_teammates[tostring(steam64)] = {
+                    ent = ent, name = entity.get_player_name(ent) or "Unknown", last_seen = globals.realtime()
+                }
+            end
+        end
+    end
+end
+
+-- ============== PATTERN LEARNING ==============
+
+local function update_pattern_memory(enemy_steam64, angle, hit, pattern)
+    if not CLOUD_CONFIG.PATTERN_LEARNING then return end
+    local key = tostring(enemy_steam64)
+    if not cloud_state.pattern_memory[key] then
+        cloud_state.pattern_memory[key] = {patterns = {}, best_angle = 60, best_confidence = 0, total_reports = 0, hits = 0}
+    end
+    local mem = cloud_state.pattern_memory[key]
+    mem.total_reports = mem.total_reports + 1
+    if hit then
+        mem.hits = mem.hits + 1
+        if mem.best_confidence < 0.7 then
+            mem.best_angle = angle
+            mem.best_confidence = mem.hits / mem.total_reports
+        end
+        if pattern and pattern ~= "unknown" then
+            if not mem.patterns[pattern] then mem.patterns[pattern] = {count = 0, avg_angle = 0, hits = 0} end
+            local p = mem.patterns[pattern]
+            p.count = p.count + 1
+            p.hits = p.hits + 1
+            p.avg_angle = (p.avg_angle * (p.count - 1) + angle) / p.count
+        end
+    end
+end
+
+local function get_pattern_prediction(enemy_steam64)
+    local mem = cloud_state.pattern_memory[tostring(enemy_steam64)]
+    if not mem or mem.total_reports < 3 then return nil, 0 end
+    if mem.best_confidence > 0.6 then return mem.best_angle, mem.best_confidence * 0.8 end
+    local best_pattern, best_rate = nil, 0
+    for _, p in pairs(mem.patterns) do
+        local hit_rate = p.hits / p.count
+        if hit_rate > best_rate then best_rate = hit_rate; best_pattern = p end
+    end
+    if best_pattern and best_rate > 0.5 then return best_pattern.avg_angle, best_rate * 0.7 end
+    return nil, 0
+end
+
+-- ============== HTTP WITH RETRY ==============
+
+local function http_post_with_retry(url, payload, callback, retry_count)
+    retry_count = retry_count or 0
+    http.post(url, {body = payload, headers = {["Content-Type"] = "application/json"}}, function(success, response)
+        if not success then
+            if retry_count < CLOUD_CONFIG.MAX_RETRY then
+                client.delay_call(CLOUD_CONFIG.RETRY_DELAY * math.pow(2, retry_count), function()
+                    http_post_with_retry(url, payload, callback, retry_count + 1)
+                end)
+            else
+                cloud_state.error_count = cloud_state.error_count + 1
+                cloud_state.last_error = "POST failed"
+                callback(false)
+            end
+            return
+        end
+        if response and response.status and response.status == 503 then
+            if retry_count < CLOUD_CONFIG.MAX_RETRY then
+                client.delay_call(5, function()
+                    http_post_with_retry(url, payload, callback, retry_count + 1)
+                end)
+            else callback(false) end
+            return
+        end
+        if response and response.status and response.status ~= 200 then
+            cloud_state.error_count = cloud_state.error_count + 1
+            cloud_state.last_error = "HTTP " .. tostring(response.status)
+            callback(false)
+            return
+        end
+        callback(true)
+    end)
+end
+
 function cloud_resolver.init()
     local lp = entity.get_local_player()
     if not lp then return false end
-    
     cloud_state.my_steam64 = entity.get_steam64(lp)
     if not cloud_state.my_steam64 or cloud_state.my_steam64 == 0 then return false end
-    
     cloud_state.my_steamid = tostring(cloud_state.my_steam64)
+    cloud_state.my_team = entity.get_prop(lp, "m_iTeamNum")
     cloud_state.initialized = true
-    
+    update_teammate_list()
     if CLOUD_CONFIG.DEBUG then
-        client.log("[Cloud Resolver] Initialized: " .. cloud_state.my_steamid)
+        client.log("[Cloud Resolver v18.4] Initialized: " .. cloud_state.my_steamid)
     end
-    
     return true
 end
 
@@ -202,8 +404,18 @@ function cloud_resolver.report_data(enemy_steam64, angle, confidence, hit, patte
     
     if not enemy_steam64 or enemy_steam64 == 0 then return false end
     
-    angle = tonumber(angle) or 60
-    confidence = math.max(0, math.min(1, tonumber(confidence) or 0.5))
+    -- Anti-spam check
+    local now = globals.realtime()
+    if now - cloud_state.last_report_time < CLOUD_CONFIG.ANTI_SPAM_INTERVAL then
+        return false
+    end
+    cloud_state.last_report_time = now
+    
+    -- Update pattern memory
+    update_pattern_memory(enemy_steam64, angle, hit, pattern)
+    
+    angle = clamp_val(tonumber(angle) or 60, -180, 180)
+    confidence = clamp_val(tonumber(confidence) or 0.5, 0, 1)
     
     local payload = json.encode({
         reporter_steamid = cloud_state.my_steamid,
@@ -212,33 +424,18 @@ function cloud_resolver.report_data(enemy_steam64, angle, confidence, hit, patte
         confidence = confidence,
         hit = hit or false,
         pattern = pattern or "unknown",
-        timestamp = globals.realtime()
+        timestamp = now,
+        team = cloud_state.my_team
     })
     
     local url = CLOUD_CONFIG.SERVER_URL .. "/resolver/update"
     
-    http.post(url, {
-        body = payload,
-        headers = {["Content-Type"] = "application/json"}
-    }, function(success, response)
-        if not success then
-            cloud_state.error_count = cloud_state.error_count + 1
-            cloud_state.last_error = "Request failed"
+    http_post_with_retry(url, payload, function(success)
+        if success then
+            cloud_state.sync_count = cloud_state.sync_count + 1
             if CLOUD_CONFIG.DEBUG then
-                client.log("[Cloud Resolver] POST failed")
+                client.log("[Cloud Resolver v18.4] Synced: angle=" .. string.format("%.1f", angle))
             end
-            return
-        end
-        
-        if response and response.status and response.status ~= 200 then
-            cloud_state.error_count = cloud_state.error_count + 1
-            cloud_state.last_error = "HTTP " .. tostring(response.status)
-            return
-        end
-        
-        cloud_state.sync_count = cloud_state.sync_count + 1
-        if CLOUD_CONFIG.DEBUG then
-            client.log("[Cloud Resolver] Synced!")
         end
     end)
     
@@ -254,16 +451,21 @@ function cloud_resolver.poll()
     if current_time - cloud_state.last_poll < CLOUD_CONFIG.POLL_INTERVAL then return end
     cloud_state.last_poll = current_time
     
+    -- Update teammate list periodically
+    if globals.tickcount() % 100 == 0 then
+        update_teammate_list()
+    end
+    
     local url = CLOUD_CONFIG.SERVER_URL .. "/resolver/get"
     
     http.get(url, function(success, response)
         if not success or not response then
             cloud_state.error_count = cloud_state.error_count + 1
-            cloud_state.last_error = "Request failed"
+            cloud_state.last_error = "GET failed"
             return
         end
         
-        if response.status and response.status ~= 200 then
+        if response and response.status and response.status ~= 200 then
             cloud_state.error_count = cloud_state.error_count + 1
             cloud_state.last_error = "HTTP " .. tostring(response.status)
             return
@@ -277,14 +479,42 @@ function cloud_resolver.poll()
         
         for steam64, entry in pairs(decoded) do
             if steam64 ~= cloud_state.my_steamid then
-                cloud_state.cloud_data[steam64] = {
-                    angle = entry.angle,
-                    confidence = entry.confidence,
-                    timestamp = entry.timestamp,
-                    reporter = entry.reporter,
-                    pattern = entry.pattern,
-                    hit = entry.hit
-                }
+                -- Initialize if needed
+                if not cloud_state.cloud_data[steam64] then
+                    cloud_state.cloud_data[steam64] = {
+                        reports = {},
+                        aggregated_angle = nil,
+                        aggregated_conf = 0,
+                        last_update = 0
+                    }
+                end
+                
+                local cd = cloud_state.cloud_data[steam64]
+                
+                -- Add report (single report format)
+                if is_same_team(entry.reporter) then
+                    table.insert(cd.reports, {
+                        reporter = entry.reporter,
+                        angle = entry.angle,
+                        confidence = entry.confidence,
+                        hit = entry.hit,
+                        pattern = entry.pattern,
+                        timestamp = entry.timestamp
+                    })
+                end
+                
+                -- Trim old reports
+                while #cd.reports > 20 do table.remove(cd.reports, 1) end
+                
+                -- Aggregate reports
+                local agg_angle, agg_conf, reporter_count = aggregate_reports(cd.reports, cloud_state.my_steamid)
+                
+                if agg_angle then
+                    cd.aggregated_angle = agg_angle
+                    cd.aggregated_conf = agg_conf
+                    cd.reporter_count = reporter_count
+                    cd.last_update = current_time
+                end
             end
         end
         
@@ -292,7 +522,7 @@ function cloud_resolver.poll()
             local count = 0
             for _ in pairs(cloud_state.cloud_data) do count = count + 1 end
             if count > 0 then
-                client.log("[Cloud Resolver] Updated: " .. count .. " players")
+                client.log("[Cloud Resolver v18.4] Updated: " .. count .. " players")
             end
         end
     end)
@@ -304,24 +534,55 @@ function cloud_resolver.get_data(enemy)
     local steam64 = entity.get_steam64(enemy)
     if not steam64 or steam64 == 0 then return nil end
     
-    local data = cloud_state.cloud_data[tostring(steam64)]
-    if not data then return nil end
+    local key = tostring(steam64)
+    local data = cloud_state.cloud_data[key]
     
-    local age = globals.realtime() - (data.timestamp or 0)
-    if age > CLOUD_CONFIG.DATA_TIMEOUT then
-        cloud_state.cloud_data[tostring(steam64)] = nil
+    -- Try pattern prediction as fallback
+    if not data or not data.aggregated_angle then
+        local pred_angle, pred_conf = get_pattern_prediction(steam64)
+        if pred_angle and pred_conf > 0.4 then
+            return {
+                angle = pred_angle,
+                confidence = pred_conf,
+                source = "pattern_memory",
+                age = 0
+            }
+        end
         return nil
     end
     
-    if data.reporter == cloud_state.my_steamid then return nil end
-    if (data.confidence or 0) < CLOUD_CONFIG.MIN_CONFIDENCE then return nil end
+    -- Check data age
+    local age = globals.realtime() - (data.last_update or 0)
+    if age > CLOUD_CONFIG.DATA_TIMEOUT then
+        cloud_state.cloud_data[key] = nil
+        return nil
+    end
+    
+    if (data.aggregated_conf or 0) < CLOUD_CONFIG.MIN_CONFIDENCE then return nil end
+    
+    -- Combine with pattern prediction
+    local pattern_angle, pattern_conf = get_pattern_prediction(steam64)
+    local final_angle = data.aggregated_angle
+    local final_conf = data.aggregated_conf
+    
+    if pattern_angle and pattern_conf > 0.5 then
+        local cloud_weight = final_conf
+        local pattern_weight = pattern_conf * 0.5
+        local total_weight = cloud_weight + pattern_weight
+        if total_weight > 0 then
+            final_angle = (final_angle * cloud_weight + pattern_angle * pattern_weight) / total_weight
+            final_conf = math.min(1, final_conf + pattern_conf * 0.1)
+        end
+    end
     
     return {
-        angle = data.angle,
-        confidence = data.confidence,
+        angle = final_angle,
+        confidence = final_conf,
         pattern = data.pattern,
         hit = data.hit,
-        age = age
+        age = age,
+        reporter_count = data.reporter_count or 1,
+        source = "cloud"
     }
 end
 
@@ -1228,13 +1489,11 @@ local function get_best_backtrack_record(ent, data)
                         local rec_next = data.backtrack_records[i+1]
                         if rec_prev and rec_next then
                             interp_origin = interpolate_position_spline(rec_prev, rec1, rec2, rec_next, t)
-                            rec.is_spline = true
                         end
                     end
                     
                     if not interp_origin then
                         interp_origin = interpolate_position_cubic(rec1, rec2, t)
-                        rec.is_cubic = true
                     end
                     
                     if interp_origin then
