@@ -1102,7 +1102,36 @@ local function get_pattern_prediction(enemy_steam64)
         return best_pattern.avg_angle, best_rate * 0.75
     end
     
-    return nil, 0
+    return nil,  0
+end
+
+-- Initialize cloud resolver
+function cloud_resolver.init()
+    local lp = entity.get_local_player()
+    if not lp then return false end
+    
+    -- Try multiple methods to get SteamID
+    local steam64 = get_local_steamid()
+    
+    if not steam64 then
+        if CLOUD_CONFIG.DEBUG then
+            client.log("[Cloud v19.0] Failed to get SteamID, will retry...")
+        end
+        return false
+    end
+    
+    cloud_state.my_steam64 = steam64
+    cloud_state.my_steamid = tostring(steam64)
+    cloud_state.my_team = entity.get_prop(lp, "m_iTeamNum")
+    cloud_state.initialized = true
+    
+    update_teammate_list()
+    
+    if CLOUD_CONFIG.DEBUG then
+        client.log("[Cloud Resolver v19.0] Initialized: " .. cloud_state.my_steamid)
+    end
+    
+    return true
 end
 
 -- Check rate limit for enemy
