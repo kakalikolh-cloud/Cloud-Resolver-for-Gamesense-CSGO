@@ -2713,7 +2713,10 @@ client.set_event_callback("setup_command", function(cmd)
         if record and tick_diff > 0 and tick_diff <= ui.get(ui_elements.bt_ticks) then
             current_target = closest_ent
             best_bt_tick = record.tick_count
-            cmd.tickcount = best_bt_tick
+            
+            -- Gamesense uses command_number for backtrack
+            cmd.command_number = best_bt_tick
+            
             data.backtrack_is_valid = true
             data.best_bt_tick = best_bt_tick
             
