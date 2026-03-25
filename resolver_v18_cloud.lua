@@ -1,6 +1,15 @@
 --[[
-    FORWARD HVH RESOLVER v19.0 - CLOUD SYNC ENHANCED
+    FORWARD HVH RESOLVER v19.1 - CLOUD SYNC ENHANCED
     Professional resolver with advanced prediction, interpolation, extrapolation
+    
+    v19.1 DT Prediction Improvements:
+    - Weapon-specific fire rate detection
+    - DT pattern analysis (aggressive, defensive, counter-strafe)
+    - Angle shift prediction during DT
+    - Side flip prediction based on DT behavior
+    - Counter-strafe detection during DT
+    - Confidence decay for DT state
+    - Integration with main resolver
     
     v19.0 Cloud Improvements:
     - Bayesian aggregation algorithm (more accurate than weighted average)
@@ -193,6 +202,10 @@ local cloud_state = {
     last_ping_time = 0,
     pending_validations = {},          -- Pending hit/miss validations
     angle_clusters = {},               -- Cached angle clusters
+    
+    -- Session ID fallback
+    session_id = nil,
+    session_id_generated = false,
 }
 
 -- ============== JSON PARSER ==============
@@ -788,48 +801,104 @@ local function get_local_steamid()
     local lp = entity.get_local_player()
     if not lp then return nil end
     
-    -- Method 1: Direct entity.get_steam64
+    -- Check if we already have it cached
+    if cloud_state.my_steam64 and cloud_state.my_steam64 ~= 0 then
+        return cloud_state.my_steam64
+    end
+    
+    -- Method 1: Direct entity.get_steam64 on local player
     local steam64 = entity.get_steam64(lp)
     if steam64 and steam64 ~= 0 then
         return steam64
     end
     
-    -- Method 2: Get from player resource
+    -- Method 2: Get local player index and use player resource
     local resource = entity.get_all("CCSPlayerResource")[1]
     if resource then
-        local local_index = client.userid_to_index and client.userid_to_index() or -1
-        if local_index >= 0 then
-            steam64 = entity.get_prop(resource, "m_iSteamID." .. local_index)
+        -- Try index 1 to 64 (local player is always in this range)
+        local lp_index = lp  -- entity index = player index for local player
+        if lp_index and lp_index > 0 and lp_index < 65 then
+            steam64 = entity.get_prop(resource, "m_iSteamID." .. lp_index)
             if steam64 and steam64 ~= 0 then
                 return steam64
             end
         end
     end
     
-    -- Method 3: Try getting from console command
-    if not cloud_state.steamid_retry then
-        cloud_state.steamid_retry = 0
-    end
-    
-    if cloud_state.steamid_retry < 3 then
-        cloud_state.steamid_retry = cloud_state.steamid_retry + 1
-        -- Will retry next tick
-        return nil
-    end
-    
-    -- Method 4: Generate session-based ID as last resort
-    local name = entity.get_player_name(lp) or ""
-    if name ~= "" then
-        -- Create a hash from name and time for uniqueness
-        local hash = 0
-        for i = 1, #name do
-            hash = (hash * 31 + string.byte(name, i)) % 2147483647
+    -- Method 3: Try using client.userid_to_index
+    if client.userid_to_index then
+        local ok, result = pcall(function()
+            -- Try getting local userid
+            for i = 1, 64 do
+                local idx = client.userid_to_index(i)
+                if idx and idx == lp then
+                    -- This userid belongs to local player
+                    if resource then
+                        steam64 = entity.get_prop(resource, "m_iSteamID." .. idx)
+                        if steam64 and steam64 ~= 0 then
+                            return steam64
+                        end
+                    end
+                end
+            end
+            return nil
+        end)
+        if ok and result then
+            return result
         end
-        hash = hash + math.floor(globals.realtime() * 1000) % 100000
-        return "session_" .. tostring(hash)
     end
     
-    return nil
+    -- Method 4: Iterate all players and find local by name match
+    local my_name = entity.get_player_name(lp)
+    if my_name and my_name ~= "" then
+        local players = entity.get_players(false)
+        if players then
+            for _, ent in ipairs(players) do
+                if entity.get_player_name(ent) == my_name then
+                    steam64 = entity.get_steam64(ent)
+                    if steam64 and steam64 ~= 0 then
+                        return steam64
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Method 5: Use engine-specific methods via pcall
+    local ok, result = pcall(function()
+        -- Try to get via panorama if available
+        if panorama and panorama.open then
+            local steamid = panorama.open().MyPersonaAPI.GetSteamId()
+            if steamid and steamid ~= "" and steamid ~= "0" then
+                return steamid
+            end
+        end
+        return nil
+    end)
+    if ok and result then
+        return result
+    end
+    
+    -- Method 6: Generate session ID as fallback (better than nothing)
+    if not cloud_state.session_id_generated then
+        local name = entity.get_player_name(lp) or ""
+        local hash = 7  -- Prime seed
+        for i = 1, #name do
+            hash = (hash * 31 + string.byte(name, i)) % 999999999
+        end
+        -- Add timestamp for uniqueness
+        hash = hash + math.floor(globals.realtime()) % 1000000
+        -- Add random component
+        hash = hash + math.random(1, 99999)
+        
+        cloud_state.session_id_generated = true
+        cloud_state.session_id = "session_" .. tostring(math.abs(hash))
+        
+        client.log("[Cloud v19.0] Generated session ID: " .. cloud_state.session_id .. " (SteamID unavailable)")
+        return cloud_state.session_id
+    end
+    
+    return cloud_state.session_id or nil
 end
 
 -- Validate report data
@@ -1114,22 +1183,48 @@ function cloud_resolver.init()
     local steam64 = get_local_steamid()
     
     if not steam64 then
+        -- Check if we have a session ID as fallback
+        if cloud_state.session_id then
+            steam64 = cloud_state.session_id
+        else
+            -- Generate session ID now
+            local name = entity.get_player_name(lp) or ""
+            if name ~= "" then
+                local hash = 7
+                for i = 1, #name do
+                    hash = (hash * 31 + string.byte(name, i)) % 999999999
+                end
+                hash = hash + math.floor(globals.realtime() * 1000) % 1000000
+                hash = hash + math.random(1, 99999)
+                steam64 = "session_" .. tostring(math.abs(hash))
+                cloud_state.session_id = steam64
+                cloud_state.session_id_generated = true
+                client.log("[Cloud v19.0] Using session ID: " .. steam64)
+            end
+        end
+    end
+    
+    if not steam64 then
         if CLOUD_CONFIG.DEBUG then
             client.log("[Cloud v19.0] Failed to get SteamID, will retry...")
         end
         return false
     end
     
-    cloud_state.my_steam64 = steam64
-    cloud_state.my_steamid = tostring(steam64)
+    -- Cache the SteamID
+    if not cloud_state.my_steam64 then
+        cloud_state.my_steam64 = steam64
+        cloud_state.my_steamid = tostring(steam64)
+        
+        -- Log what type of ID we got
+        local id_type = tostring(steam64):find("session_") and " (session)" or " (steam64)"
+        client.log("[Cloud v19.0] ID: " .. tostring(steam64) .. id_type)
+    end
+    
     cloud_state.my_team = entity.get_prop(lp, "m_iTeamNum")
     cloud_state.initialized = true
     
     update_teammate_list()
-    
-    if CLOUD_CONFIG.DEBUG then
-        client.log("[Cloud Resolver v19.0] Initialized: " .. cloud_state.my_steamid)
-    end
     
     return true
 end
@@ -1520,6 +1615,7 @@ local function create_player_data()
         successful_resolves = {},
         best_tick_history = {},
         dt_shots = {},
+        dt_velocity_history = {},
         body_yaw_history = {},
         duck_history = {},
         
@@ -1536,9 +1632,18 @@ local function create_player_data()
         shots = 0, hits = 0, misses = 0,
         consecutive_hits = 0, consecutive_misses = 0,
         
+        -- DT v19.1 fields
         dt_detected = false,
         dt_confidence = 0,
         dt_angle_offset = 0,
+        dt_pattern = nil,
+        dt_pattern_confidence = 0,
+        dt_shift_probability = 0,
+        dt_angle_direction = 0,
+        dt_counter_strafe = false,
+        dt_last_fire_time = 0,
+        dt_expected_next_shot = 0,
+        dt_used = false,
         last_ammo = -1,
         
         backtrack_is_valid = false,
@@ -1556,6 +1661,7 @@ local function create_player_data()
         predicted_origin = {x=0,y=0,z=0},
         extrapolation_confidence = 0.5,
         lc_break_detected = false,
+        is_lc_break = false,
         velocity_delta = 0,
         origin_delta = 0,
         
@@ -1591,7 +1697,10 @@ local function create_player_data()
         move_yaw_diff = 0,
         bf_stage = 0,
         top_source = "none",
-        resolve_source = "none"
+        resolve_source = "none",
+        selected_angle_preset = "standard",
+        side_votes = {},
+        vote_reasons = {},
     }
 end
 
@@ -1624,9 +1733,12 @@ local ui_elements = {
     ie_extrapolation = ui.new_checkbox("RAGE", "Other", "Enable Extrapolation"),
     ie_extrapolation_ticks = ui.new_slider("RAGE", "Other", "Max Extrapolation", 1, 12, 6, true, "ticks"),
     
-    dt_label = ui.new_label("RAGE", "Other", "━━━ Double Tap ━━━"),
+    dt_label = ui.new_label("RAGE", "Other", "━━━ Double Tap v19.1 ━━━"),
     dt_predict = ui.new_checkbox("RAGE", "Other", "DT Prediction"),
     dt_aggression = ui.new_slider("RAGE", "Other", "DT Angle Shift", 0, 30, 15, true, "°"),
+    dt_pattern_mode = ui.new_combobox("RAGE", "Other", "DT Pattern", {"Auto", "Aggressive", "Defensive", "Counter-Strafe"}),
+    dt_side_flip = ui.new_checkbox("RAGE", "Other", "DT Side Flip"),
+    dt_log = ui.new_checkbox("RAGE", "Other", "Log DT Detection"),
     
     adv_label = ui.new_label("RAGE", "Other", "━━━ Settings ━━━"),
     aggression = ui.new_slider("RAGE", "Other", "Aggression", 1, 10, 7, true, "lvl"),
@@ -1642,11 +1754,13 @@ local ui_elements = {
         cloud_state.prediction_cache = {}
         cloud_state.pattern_memory = {}
         cloud_state.reporter_reputation = {}
-        client.log("[Resolver v19.0] Data reset")
+        client.log("[Resolver v19.1] Data reset")
     end)
 }
 
 ui.set(ui_elements.dt_predict, true)
+ui.set(ui_elements.dt_side_flip, true)
+ui.set(ui_elements.dt_log, true)
 ui.set(ui_elements.show_stats, true)
 ui.set(ui_elements.ie_interpolation, true)
 ui.set(ui_elements.ie_extrapolation, true)
@@ -1723,15 +1837,37 @@ local function record_backtrack(ent, data)
     data.velocity_delta = vec_distance(data.prev_velocity.x, data.prev_velocity.y, data.prev_velocity.z, vx, vy, vz)
     data.origin_delta = vec_distance(data.prev_origin.x, data.prev_origin.y, data.prev_origin.z, ox, oy, oz)
     
-    -- LC break detection (Lag Compensation break - exploit for backtrack)
-    -- More aggressive detection for extended backtrack
-    local lc_break = data.origin_delta > 48 or data.velocity_delta > 150 or not is_grounded
-    
-    -- Store LC break strength for scoring
+    -- LC break detection (Lag Compensation break)
+    -- Realistic thresholds - only true lag compensation breaks
+    -- Standard movement is ~30 units/origin_delta max per tick
+    local lc_break = false
     local lc_break_strength = 0
-    if data.origin_delta > 48 then lc_break_strength = lc_break_strength + data.origin_delta end
-    if data.velocity_delta > 150 then lc_break_strength = lc_break_strength + data.velocity_delta * 0.5 end
-    if not is_grounded then lc_break_strength = lc_break_strength + 50 end
+    
+    -- Origin jump (teleport) - real LC break
+    if data.origin_delta > 64 then
+        lc_break = true
+        lc_break_strength = lc_break_strength + data.origin_delta
+    end
+    
+    -- Velocity spike - sudden speed change
+    if data.velocity_delta > 250 then
+        lc_break = true
+        lc_break_strength = lc_break_strength + data.velocity_delta * 0.3
+    end
+    
+    -- Combined: high origin + velocity = definite LC break
+    if data.origin_delta > 40 and data.velocity_delta > 200 then
+        lc_break = true
+        lc_break_strength = lc_break_strength + 50
+    end
+    
+    -- Air + high velocity change = potential exploit
+    if not is_grounded and data.velocity_delta > 150 then
+        lc_break = true
+        lc_break_strength = lc_break_strength + 30
+    end
+    
+    data.is_lc_break = lc_break
     
     -- Calculate angle delta for jitter detection
     local angle_delta = 0
@@ -1768,7 +1904,7 @@ local function record_backtrack(ent, data)
         speed = speed,
         speed_2d = speed_2d,
         is_grounded = is_grounded,
-        is_lc_break = lc_break,
+        is_lc_break = data.is_lc_break or false,
         lc_break_strength = lc_break_strength,  -- Strength of LC break for extended BT
         predicted_origin = predicted,
         confidence = data.confidence,
@@ -1845,156 +1981,107 @@ local function get_best_backtrack_record(ent, data)
     for _, cand in ipairs(candidates) do
         local rec = cand.record
         local tick_diff = cand.tick_diff
-        local score = 0
+        local score = 100  -- Base score
         local reasons = {}
         
-        -- === DISTANCE SCORING ===
-        local dist_to_origin = vec_distance(lx, ly, lz, rec.origin.x, rec.origin.y, rec.origin.z)
-        
-        -- Prefer closer targets (exponential decay)
-        local dist_score = math.max(0, 200 - dist_to_origin * 0.5)
-        score = score + dist_score
-        
-        if dist_to_origin < 200 then
-            table.insert(reasons, "close")
-        elseif dist_to_origin > 1500 then
-            score = score - 50
-            table.insert(reasons, "far")
-        end
-        
-        -- === TICK SCORING ===
-        -- Prefer fresher ticks but not too fresh
-        -- Extended range: 8-28 ticks for skeet-style long backtrack
-        if tick_diff <= 3 then
-            -- Too fresh, might be interpolated weirdly
-            score = score - 10
-        elseif tick_diff >= 8 and tick_diff <= 18 then
-            -- Standard sweet spot for backtrack exploit
-            score = score + 25
+        -- === TICK SCORING (MOST IMPORTANT) ===
+        -- Prefer fresh ticks, sweet spot is 1-14 for reliable backtrack
+        if tick_diff <= 2 then
+            -- Very fresh - might still be valid
+            score = score + 50
+            table.insert(reasons, "fresh")
+        elseif tick_diff >= 3 and tick_diff <= 7 then
+            -- Good range - reliable
+            score = score + 60
+            table.insert(reasons, "good_tick")
+        elseif tick_diff >= 8 and tick_diff <= 14 then
+            -- Sweet spot for backtrack
+            score = score + 70
             table.insert(reasons, "sweet_tick")
-        elseif tick_diff >= 18 and tick_diff <= 28 then
-            -- Extended range - higher reward for LC breaks
-            score = score + 35  -- Higher base score for extended range
-            table.insert(reasons, "extended_tick")
-        elseif tick_diff > 28 then
-            -- Very old but still possible on some servers
-            score = score + 20
-            table.insert(reasons, "ultra_tick")
+        elseif tick_diff >= 15 and tick_diff <= 20 then
+            -- Extended but still reliable on some servers
+            score = score + 40
+            table.insert(reasons, "extended")
+        elseif tick_diff > 20 then
+            -- Very old - only use if necessary
+            score = score - 20
+            score = score - (tick_diff - 20) * 2  -- Penalty per tick over 20
+            table.insert(reasons, "old")
         end
         
-        -- === LC BREAK SCORING (HIGHEST PRIORITY) ===
-        -- LC break allows extended backtrack (20-30+ ticks)
+        -- === LC BREAK SCORING ===
+        -- LC break only helps for extended range, not a huge bonus
         if rec.is_lc_break then
-            -- Massive bonus for LC break, especially for extended range
-            local lc_bonus = 150
-            if tick_diff > 18 then
-                -- Extra bonus for extended range with LC break
-                lc_bonus = lc_bonus + (tick_diff - 18) * 10  -- +10 per tick over 18
+            if tick_diff > 14 then
+                -- LC break helps for extended ticks
+                score = score + 30
+                table.insert(reasons, "lc_break")
             end
-            -- Add LC break strength bonus
-            lc_bonus = lc_bonus + (rec.lc_break_strength or 0) * 0.3
-            score = score + lc_bonus
-            table.insert(reasons, "LC_BREAK")
+            -- Don't give bonus for normal ticks with LC break
         end
         
         -- === VELOCITY SCORING ===
         if rec.speed then
-            if rec.speed < 10 then
-                -- Stationary target - BEST for extended backtrack!
-                local stationary_bonus = 80
-                if tick_diff > 18 then
-                    -- Stationary targets are GOLD for extended backtrack
-                    stationary_bonus = stationary_bonus + 30
-                    table.insert(reasons, "extended_stationary")
-                end
-                score = score + stationary_bonus
-                table.insert(reasons, "stationary")
-            elseif rec.speed < 50 then
-                -- Slow moving - GOOD
+            if rec.speed < 5 then
+                -- Completely stationary - excellent
                 score = score + 40
+                table.insert(reasons, "stationary")
+            elseif rec.speed < 30 then
+                -- Slow moving - good
+                score = score + 25
                 table.insert(reasons, "slow")
-            elseif rec.speed < 150 then
+            elseif rec.speed < 100 then
                 -- Medium speed - OK
                 score = score + 10
-            elseif rec.speed > 300 then
-                -- Very fast - but might be LC break!
-                if rec.is_lc_break then
-                    -- Fast + LC break = extended backtrack opportunity
-                    score = score + 20
-                    table.insert(reasons, "fast_lc")
-                else
-                    score = score - 30
-                    table.insert(reasons, "fast")
-                end
+            elseif rec.speed > 250 then
+                -- Very fast - harder to hit
+                score = score - 15
+                table.insert(reasons, "fast")
             end
+        end
+        
+        -- === DISTANCE SCORING ===
+        local dist_to_origin = vec_distance(lx, ly, lz, rec.origin.x, rec.origin.y, rec.origin.z)
+        
+        if dist_to_origin < 300 then
+            score = score + 30
+            table.insert(reasons, "close")
+        elseif dist_to_origin < 800 then
+            score = score + 15
+        elseif dist_to_origin > 2000 then
+            score = score - 20
+            table.insert(reasons, "far")
         end
         
         -- === GROUND STATE SCORING ===
         if rec.is_grounded then
-            score = score + 25
-            table.insert(reasons, "grounded")
-        else
-            -- In air - LC break potential, great for extended backtrack!
-            score = score + 40  -- Bonus for air (LC break = extended BT)
-            table.insert(reasons, "air_lc")
-        end
-        
-        -- === DUCK STATE SCORING ===
-        if rec.is_ducking then
-            -- Smaller target but also slower usually
-            score = score - 15
-        else
-            -- Standing - bigger hitbox
             score = score + 15
-            table.insert(reasons, "standing")
+        else
+            -- In air - less predictable
+            score = score - 10
+            table.insert(reasons, "air")
         end
         
-        -- === ANGLE DELTA SCORING ===
-        if rec.angle_delta then
-            if rec.angle_delta > 30 then
-                -- High jitter/angle change - might be desync
-                score = score + 20
-                table.insert(reasons, "jitter")
-            elseif rec.angle_delta < 5 then
-                -- Stable angle - easier to hit
-                score = score + 15
-            end
-        end
-        
-        -- === HEAD POSITION CHECK ===
-        if rec.head and rec.head.x then
-            local head_dist = vec_distance(eye_x, eye_y, eye_z, rec.head.x, rec.head.y, rec.head.z)
-            
-            -- Prefer head positions that are hittable
-            if head_dist < 500 then
-                score = score + 25
-                table.insert(reasons, "head_close")
-            end
-        end
-        
-        -- === BODY AIM BONUS ===
-        if rec.chest and rec.chest.x then
-            local chest_dist = vec_distance(eye_x, eye_y, eye_z, rec.chest.x, rec.chest.y, rec.chest.z)
-            if chest_dist < dist_to_origin + 100 then
-                score = score + 15
-            end
+        -- === DUCK STATE ===
+        if rec.is_ducking then
+            -- Smaller hitbox but often easier to hit due to less movement
+            score = score + 5
         end
         
         -- === PATTERN BONUS ===
-        -- If this tick was successful before
+        -- If we hit with similar tick before, give bonus
         if data.best_tick_history then
             for _, bt in ipairs(data.best_tick_history) do
-                if bt.tick_diff == tick_diff and bt.hit then
-                    score = score + 25
+                if math.abs(bt.tick_diff - tick_diff) < 3 and bt.hit then
+                    score = score + 20
                     table.insert(reasons, "past_hit")
                     break
                 end
             end
         end
         
-        -- === RANDOMIZATION (small) ===
-        -- Add tiny random factor to break ties
-        score = score + math.random() * 2
+        -- Small random factor for variety
+        score = score + math.random() * 3
         
         if score > best_score then
             best_score = score
@@ -2344,6 +2431,766 @@ local function analyze_fake_duck(ent, data)
     return false
 end
 
+-- ============== ADVANCED PITCH ANALYSIS ==============
+
+-- Analyze pitch for fake pitch detection
+local function analyze_pitch(ent, data)
+    local pitch = entity.get_prop(ent, "m_angEyeAngles[0]")
+    if not pitch then return end
+    
+    -- Store pitch history
+    if not data.pitch_history then data.pitch_history = {} end
+    table.insert(data.pitch_history, {pitch = pitch, time = globals.realtime()})
+    while #data.pitch_history > 30 do table.remove(data.pitch_history, 1) end
+    
+    -- Analyze pitch patterns
+    if #data.pitch_history >= 5 then
+        local avg_pitch = 0
+        local pitch_variance = 0
+        
+        for _, p in ipairs(data.pitch_history) do
+            avg_pitch = avg_pitch + p.pitch
+        end
+        avg_pitch = avg_pitch / #data.pitch_history
+        
+        for _, p in ipairs(data.pitch_history) do
+            pitch_variance = pitch_variance + (p.pitch - avg_pitch)^2
+        end
+        pitch_variance = pitch_variance / #data.pitch_history
+        
+        data.avg_pitch = avg_pitch
+        data.pitch_variance = pitch_variance
+        
+        -- Detect fake pitch patterns
+        if math.abs(avg_pitch) > 75 then
+            -- Extreme pitch = likely fake pitch
+            data.is_fake_pitch = true
+            data.pitch_type = "fake"
+        elseif pitch_variance > 500 then
+            -- High variance = jitter on pitch
+            data.is_fake_pitch = true
+            data.pitch_type = "jitter"
+        elseif math.abs(pitch) < 15 and math.abs(avg_pitch) < 20 then
+            -- Near zero = might be hiding real pitch
+            data.is_fake_pitch = false
+            data.pitch_type = "normal"
+        else
+            data.is_fake_pitch = false
+            data.pitch_type = "unknown"
+        end
+    end
+end
+
+-- ============== DESYNC ANALYSIS ==============
+
+-- Calculate desync amount and detect extended desync
+local function analyze_desync(ent, data)
+    local body_yaw = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_YAW)
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+    
+    if not body_yaw or not eye_yaw then return end
+    
+    -- Convert body_yaw to degrees (-180 to 180)
+    body_yaw = body_yaw * 360 - 180
+    
+    -- Calculate desync amount
+    local desync_amount = math.abs(body_yaw)
+    data.current_desync = desync_amount
+    
+    -- Store desync history
+    if not data.desync_history then data.desync_history = {} end
+    table.insert(data.desync_history, {amount = desync_amount, time = globals.realtime()})
+    while #data.desync_history > 50 do table.remove(data.desync_history, 1) end
+    
+    -- Calculate average desync
+    if #data.desync_history >= 5 then
+        local avg_desync = 0
+        local max_desync = 0
+        local min_desync = 180
+        
+        for _, d in ipairs(data.desync_history) do
+            avg_desync = avg_desync + d.amount
+            max_desync = math.max(max_desync, d.amount)
+            min_desync = math.min(min_desync, d.amount)
+        end
+        avg_desync = avg_desync / #data.desync_history
+        
+        data.avg_desync = avg_desync
+        data.max_desync = max_desync
+        data.min_desync = min_desync
+        data.desync_range = max_desync - min_desync
+        
+        -- Detect extended desync
+        if max_desync > 58 then
+            data.has_extended_desync = true
+            data.extended_desync_amount = max_desync - 58
+        else
+            data.has_extended_desync = false
+            data.extended_desync_amount = 0
+        end
+        
+        -- Detect desync pattern
+        if data.desync_range < 10 then
+            data.desync_pattern = "stable"
+        elseif data.desync_range < 30 then
+            data.desync_pattern = "variable"
+        else
+            data.desync_pattern = "unstable"
+        end
+    end
+    
+    -- Determine desync side from body yaw
+    if math.abs(body_yaw) > 8 then
+        if body_yaw > 0 then
+            data.desync_side = SIDES.LEFT  -- Body yaw positive = real is on left
+        else
+            data.desync_side = SIDES.RIGHT  -- Body yaw negative = real is on right
+        end
+        data.desync_confidence = math.min(math.abs(body_yaw) / 60, 1.0)
+    else
+        data.desync_side = SIDES.CENTER
+        data.desync_confidence = 0.2
+    end
+end
+
+-- ============== SKEET PATTERN DETECTION ==============
+
+-- Detect common skeet AA patterns
+local function detect_skeet_pattern(data)
+    if #data.angle_history < 10 then return nil, 0 end
+    
+    local pattern_score = 0
+    local detected_pattern = nil
+    
+    -- Analyze recent angles
+    local angles = {}
+    for i = #data.angle_history - 9, #data.angle_history do
+        if data.angle_history[i] then
+            table.insert(angles, data.angle_history[i].angle)
+        end
+    end
+    
+    if #angles < 8 then return nil, 0 end
+    
+    -- Skeet static pattern: angles stay around specific values
+    local angle_groups = {}
+    for _, a in ipairs(angles) do
+        local rounded = math.floor(a / 30) * 30
+        if not angle_groups[rounded] then angle_groups[rounded] = 0 end
+        angle_groups[rounded] = angle_groups[rounded] + 1
+    end
+    
+    local max_group = 0
+    local max_angle = 0
+    for angle, count in pairs(angle_groups) do
+        if count > max_group then
+            max_group = count
+            max_angle = angle
+        end
+    end
+    
+    -- Skeet jitter pattern: rapid oscillation between 2-3 angles
+    local unique_angles = 0
+    for _ in pairs(angle_groups) do unique_angles = unique_angles + 1 end
+    
+    if unique_angles <= 3 and max_group >= 5 then
+        detected_pattern = "skeet_static"
+        pattern_score = 0.75
+        data.skeet_base_angle = max_angle
+    elseif unique_angles <= 5 and data.jitter_score and data.jitter_score > 20 then
+        detected_pattern = "skeet_jitter"
+        pattern_score = 0.65
+    end
+    
+    -- Skeet spin pattern: consistent rotation with occasional breaks
+    if data.is_spinning and data.spin_consistency and data.spin_consistency > 0.7 then
+        if data.spin_speed and data.spin_speed > 30 and data.spin_speed < 150 then
+            detected_pattern = "skeet_spin"
+            pattern_score = 0.80
+        end
+    end
+    
+    return detected_pattern, pattern_score
+end
+
+-- ============== ADAPTIVE LEARNING ==============
+
+-- Learn from hit/miss and adjust angles
+local function adaptive_learn(data, hit, angle, pattern)
+    if not data.adaptive_memory then
+        data.adaptive_memory = {
+            angles = {},      -- Successful angles per pattern
+            sides = {},       -- Successful sides per pattern
+            misses = {},      -- Miss counts per angle range
+            last_adjust = 0,
+        }
+    end
+    
+    local mem = data.adaptive_memory
+    local pattern_key = pattern or "unknown"
+    
+    if hit then
+        -- Record successful angle
+        if not mem.angles[pattern_key] then mem.angles[pattern_key] = {} end
+        table.insert(mem.angles[pattern_key], {
+            angle = angle,
+            time = globals.realtime()
+        })
+        
+        -- Keep only recent hits
+        while #mem.angles[pattern_key] > 10 do
+            table.remove(mem.angles[pattern_key], 1)
+        end
+        
+        -- Record successful side
+        mem.sides[pattern_key] = angle > 0 and "left" or "right"
+    else
+        -- Record miss
+        local angle_range = math.floor(math.abs(angle) / 15) * 15
+        local range_key = pattern_key .. "_" .. tostring(angle_range)
+        
+        if not mem.misses[range_key] then mem.misses[range_key] = 0 end
+        mem.misses[range_key] = mem.misses[range_key] + 1
+    end
+end
+
+-- Get adaptive angle adjustment
+local function get_adaptive_adjustment(data, pattern)
+    if not data.adaptive_memory then return 0 end
+    
+    local mem = data.adaptive_memory
+    local pattern_key = pattern or "unknown"
+    
+    -- Check if we have successful angles for this pattern
+    if mem.angles[pattern_key] and #mem.angles[pattern_key] >= 2 then
+        -- Calculate average successful angle
+        local sum = 0
+        local count = 0
+        local now = globals.realtime()
+        
+        for _, a in ipairs(mem.angles[pattern_key]) do
+            -- Weight recent hits more
+            local age = now - a.time
+            if age < 30 then
+                local weight = 1 - age / 30
+                sum = sum + a.angle * weight
+                count = count + weight
+            end
+        end
+        
+        if count > 0 then
+            local avg_angle = sum / count
+            -- Return adjustment to move towards successful angle
+            return avg_angle * 0.3
+        end
+    end
+    
+    return 0
+end
+
+-- ============== LAG COMPENSATION ANALYSIS ==============
+
+-- Analyze lag compensation for exploit detection
+local function analyze_lag_comp(ent, data)
+    local sim_time = entity.get_prop(ent, "m_flSimulationTime")
+    local old_sim_time = data.last_sim_time or sim_time
+    
+    if not sim_time then return end
+    
+    -- Calculate sim time delta
+    local sim_delta = sim_time - old_sim_time
+    data.sim_time_delta = sim_delta
+    data.last_sim_time = sim_time
+    
+    -- Store sim time history
+    if not data.sim_time_history then data.sim_time_history = {} end
+    table.insert(data.sim_time_history, {sim_time = sim_time, delta = sim_delta, time = globals.realtime()})
+    while #data.sim_time_history > 30 do table.remove(data.sim_time_history, 1) end
+    
+    -- Detect lag exploit
+    if sim_delta > 0.2 then
+        -- Large sim time jump = potential exploit
+        data.lag_exploit_detected = true
+        data.lag_exploit_amount = sim_delta
+    else
+        data.lag_exploit_detected = false
+        data.lag_exploit_amount = 0
+    end
+    
+    -- Detect time manipulation
+    if sim_delta < 0 and sim_delta > -0.1 then
+        -- Small negative delta = time manipulation
+        data.time_manipulation = true
+    else
+        data.time_manipulation = false
+    end
+end
+
+-- ============== ANTI-OVERRIDE DETECTION ==============
+
+-- Detect if enemy is using anti-override
+local function detect_anti_override(data)
+    if #data.angle_history < 8 then return false end
+    
+    -- Anti-override typically shows:
+    -- 1. Very consistent angles
+    -- 2. Angles at specific values (multiples of 30 or 45)
+    -- 3. Little to no jitter
+    
+    local angle_changes = 0
+    local consistent_count = 0
+    local special_angles = 0
+    
+    for i = #data.angle_history - 7, #data.angle_history do
+        if i > 1 and data.angle_history[i] and data.angle_history[i-1] then
+            local diff = math.abs(angle_diff(data.angle_history[i].angle, data.angle_history[i-1].angle))
+            if diff < 2 then
+                consistent_count = consistent_count + 1
+            elseif diff > 10 then
+                angle_changes = angle_changes + 1
+            end
+            
+            -- Check for special angle values
+            local angle = data.angle_history[i].angle
+            if math.abs(angle % 30) < 3 or math.abs(angle % 45) < 3 then
+                special_angles = special_angles + 1
+            end
+        end
+    end
+    
+    -- Anti-override indicators
+    if consistent_count >= 5 and angle_changes <= 2 and special_angles >= 4 then
+        data.is_anti_override = true
+        data.anti_override_confidence = consistent_count / 8
+        return true
+    end
+    
+    data.is_anti_override = false
+    data.anti_override_confidence = 0
+    return false
+end
+
+-- ============== SMART BRUTEFORCE ==============
+
+-- Intelligent bruteforce based on miss analysis
+local function smart_bruteforce(data)
+    if data.consecutive_misses < 1 then
+        return nil, 0, "no_bf"
+    end
+    
+    local miss_count = data.consecutive_misses
+    local bf_stage = math.min(miss_count, 6)
+    
+    -- Advanced bruteforce angles based on miss count
+    local bf_presets = {
+        [1] = {angle = 51, side = SIDES.LEFT, conf = 0.5},      -- skeet_small
+        [2] = {angle = 63, side = SIDES.RIGHT, conf = 0.55},    -- skeet_standard
+        [3] = {angle = 77, side = SIDES.LEFT, conf = 0.6},      -- skeet_wide
+        [4] = {angle = 95, side = SIDES.RIGHT, conf = 0.65},    -- skeet_extended
+        [5] = {angle = 110, side = SIDES.LEFT, conf = 0.7},     -- anti_override
+        [6] = {angle = 135, side = SIDES.RIGHT, conf = 0.75},   -- bruteforce
+    }
+    
+    -- Adjust based on adaptive learning
+    local adaptive_adj = get_adaptive_adjustment(data, "bruteforce")
+    
+    local bf = bf_presets[bf_stage]
+    local final_angle = bf.angle + adaptive_adj
+    
+    data.bf_stage = bf_stage
+    data.bf_angle = final_angle
+    
+    return bf.side, bf.conf, "smart_bf_" .. bf_stage
+end
+
+-- ============== PREDICTIVE RESOLVER ==============
+
+-- Predict next angle based on pattern
+local function predict_next_angle(data)
+    if #data.angle_history < 5 then return nil end
+    
+    local recent = {}
+    for i = #data.angle_history - 4, #data.angle_history do
+        if data.angle_history[i] then
+            table.insert(recent, data.angle_history[i].angle)
+        end
+    end
+    
+    if #recent < 4 then return nil end
+    
+    -- Calculate velocity of angle changes
+    local velocities = {}
+    for i = 2, #recent do
+        table.insert(velocities, angle_diff(recent[i], recent[i-1]))
+    end
+    
+    -- Calculate acceleration
+    local accelerations = {}
+    for i = 2, #velocities do
+        table.insert(accelerations, velocities[i] - velocities[i-1])
+    end
+    
+    -- Predict using kinematics
+    local last_angle = recent[#recent]
+    local last_velocity = velocities[#velocities] or 0
+    local avg_acceleration = 0
+    
+    if #accelerations > 0 then
+        for _, a in ipairs(accelerations) do
+            avg_acceleration = avg_acceleration + a
+        end
+        avg_acceleration = avg_acceleration / #accelerations
+    end
+    
+    -- Predict next angle
+    local predicted_angle = last_angle + last_velocity + 0.5 * avg_acceleration
+    predicted_angle = normalize_angle(predicted_angle)
+    
+    data.predicted_angle = predicted_angle
+    data.angle_velocity = last_velocity
+    data.angle_acceleration = avg_acceleration
+    
+    return predicted_angle
+end
+
+-- ============== ADVANCED ANGLE SYSTEM ==============
+
+-- Non-standard angles for different AA types
+local ANGLE_PRESETS = {
+    -- Standard angles
+    micro = { angle = 17, desc = "Micro desync" },
+    small = { angle = 30, desc = "Small desync" },
+    medium = { angle = 45, desc = "Medium" },
+    standard = { angle = 58, desc = "Standard" },
+    extended = { angle = 72, desc = "Extended" },
+    wide = { angle = 90, desc = "Wide desync" },
+    
+    -- Non-standard angles (skeet/advanced)
+    skeet_small = { angle = 51, desc = "Skeet small" },
+    skeet_standard = { angle = 63, desc = "Skeet standard" },
+    skeet_wide = { angle = 77, desc = "Skeet wide" },
+    skeet_extended = { angle = 95, desc = "Skeet extended" },
+    
+    -- Extreme angles
+    anti_override = { angle = 110, desc = "Anti-override" },
+    extreme = { angle = 120, desc = "Extreme" },
+    bruteforce = { angle = 135, desc = "Bruteforce" },
+    max = { angle = 165, desc = "Maximum" },
+    
+    -- Special angles
+    fakehead = { angle = 0, desc = "Fakehead" },
+    center = { angle = 3, desc = "Near center" },
+    jitter_small = { angle = 22, desc = "Jitter small" },
+    jitter_wide = { angle = 48, desc = "Jitter wide" },
+    
+    -- Dynamic angles (changed based on situation)
+    dynamic_close = { angle = 42, desc = "Close range" },
+    dynamic_far = { angle = 68, desc = "Far range" },
+    dynamic_air = { angle = 55, desc = "In air" },
+    dynamic_moving = { angle = 52, desc = "Moving" },
+    dynamic_stationary = { angle = 60, desc = "Stationary" },
+}
+
+-- Angle selection based on multiple factors
+local function select_angle(ent, data, pattern, distance, confidence)
+    local angle_set = {}
+    local best_angle = ANGLE_PRESETS.standard.angle
+    local angle_name = "standard"
+    
+    -- Get distance category
+    local dist_cat = "medium"
+    if distance < 300 then dist_cat = "close"
+    elseif distance > 1500 then dist_cat = "far" end
+    
+    -- Get speed category
+    local speed_cat = "stationary"
+    if data.current_speed > 200 then speed_cat = "fast"
+    elseif data.current_speed > 50 then speed_cat = "moving"
+    elseif data.current_speed > 10 then speed_cat = "slow" end
+    
+    -- Base angle selection by pattern
+    if pattern == "spin" then
+        -- Spin bot - use angle based on spin speed
+        local spin_speed = math.abs(data.spin_speed or 0)
+        if spin_speed > 100 then
+            table.insert(angle_set, { name = "extreme", weight = 3.0 })
+            table.insert(angle_set, { name = "max", weight = 2.5 })
+        elseif spin_speed > 60 then
+            table.insert(angle_set, { name = "skeet_extended", weight = 3.0 })
+            table.insert(angle_set, { name = "anti_override", weight = 2.0 })
+        else
+            table.insert(angle_set, { name = "wide", weight = 3.0 })
+            table.insert(angle_set, { name = "extended", weight = 2.5 })
+        end
+        
+    elseif pattern == "fast_jitter" then
+        -- Fast jitter - use specific angles
+        table.insert(angle_set, { name = "jitter_wide", weight = 3.0 })
+        table.insert(angle_set, { name = "skeet_wide", weight = 2.5 })
+        table.insert(angle_set, { name = "wide", weight = 2.0 })
+        
+    elseif pattern == "jitter" then
+        -- Normal jitter
+        table.insert(angle_set, { name = "skeet_standard", weight = 3.0 })
+        table.insert(angle_set, { name = "jitter_small", weight = 2.0 })
+        table.insert(angle_set, { name = "standard", weight = 1.5 })
+        
+    elseif pattern == "micro_jitter" then
+        -- Micro jitter - small angles
+        table.insert(angle_set, { name = "jitter_small", weight = 3.0 })
+        table.insert(angle_set, { name = "small", weight = 2.5 })
+        table.insert(angle_set, { name = "micro", weight = 2.0 })
+        
+    elseif pattern == "fake_duck" then
+        -- Fake duck - specific angles
+        if data.fake_duck_phase == "up" then
+            table.insert(angle_set, { name = "small", weight = 3.0 })
+            table.insert(angle_set, { name = "micro", weight = 2.0 })
+        else
+            table.insert(angle_set, { name = "skeet_small", weight = 3.0 })
+            table.insert(angle_set, { name = "medium", weight = 2.0 })
+        end
+        
+    elseif pattern == "freestanding" then
+        -- Freestanding - wider angles
+        table.insert(angle_set, { name = "skeet_wide", weight = 3.0 })
+        table.insert(angle_set, { name = "wide", weight = 2.5 })
+        
+    else
+        -- Unknown pattern - use dynamic angles
+        -- Based on distance
+        if dist_cat == "close" then
+            table.insert(angle_set, { name = "dynamic_close", weight = 2.0 })
+            table.insert(angle_set, { name = "skeet_small", weight = 1.5 })
+        elseif dist_cat == "far" then
+            table.insert(angle_set, { name = "dynamic_far", weight = 2.0 })
+            table.insert(angle_set, { name = "skeet_extended", weight = 1.5 })
+        else
+            table.insert(angle_set, { name = "standard", weight = 2.0 })
+            table.insert(angle_set, { name = "skeet_standard", weight = 1.5 })
+        end
+        
+        -- Based on speed
+        if speed_cat == "fast" then
+            table.insert(angle_set, { name = "dynamic_moving", weight = 1.5 })
+        elseif speed_cat == "stationary" then
+            table.insert(angle_set, { name = "dynamic_stationary", weight = 1.5 })
+        end
+        
+        -- Air bonus
+        if not data.is_grounded then
+            table.insert(angle_set, { name = "dynamic_air", weight = 2.0 })
+        end
+    end
+    
+    -- Adjust for consecutive misses (bruteforce)
+    if data.consecutive_misses >= 1 then
+        local bf_stage = math.min(data.consecutive_misses, 4)
+        local bf_angles = {
+            [1] = "skeet_standard",
+            [2] = "extended",
+            [3] = "anti_override",
+            [4] = "bruteforce"
+        }
+        table.insert(angle_set, { name = bf_angles[bf_stage], weight = 3.0 + bf_stage * 0.5 })
+    end
+    
+    -- Adjust for high confidence (use more aggressive angles)
+    if confidence > 0.7 then
+        table.insert(angle_set, { name = "skeet_wide", weight = 2.0 })
+    elseif confidence < 0.4 then
+        table.insert(angle_set, { name = "skeet_small", weight = 2.0 })
+        table.insert(angle_set, { name = "medium", weight = 1.5 })
+    end
+    
+    -- Select best angle from set
+    if #angle_set > 0 then
+        table.sort(angle_set, function(a, b) return a.weight > b.weight end)
+        local selected = angle_set[1].name
+        if ANGLE_PRESETS[selected] then
+            best_angle = ANGLE_PRESETS[selected].angle
+            angle_name = selected
+        end
+    end
+    
+    -- Apply aggression multiplier
+    local aggression = ui.get(ui_elements.aggression) or 7
+    local aggression_mult = 0.7 + (aggression / 10) * 0.6  -- 0.7 to 1.3
+    
+    -- Random variance (small, to break patterns)
+    local variance = (math.random() - 0.5) * 4  -- -2 to +2 degrees
+    
+    local final_angle = best_angle * aggression_mult + variance
+    final_angle = clamp(final_angle, 10, 165)
+    
+    data.selected_angle_preset = angle_name
+    
+    return final_angle, angle_name
+end
+
+-- Advanced side detection with weighted voting
+local function detect_side_advanced(ent, data, pattern)
+    local votes = {
+        [SIDES.LEFT] = 0,
+        [SIDES.RIGHT] = 0,
+        [SIDES.CENTER] = 0
+    }
+    local vote_reasons = {}
+    
+    -- === DESYNC-BASED SIDE (highest confidence) ===
+    if data.desync_side and data.desync_confidence and data.desync_confidence > 0.3 then
+        votes[data.desync_side] = votes[data.desync_side] + 3.5 * data.desync_confidence
+        table.insert(vote_reasons, "desync_" .. (data.desync_side == SIDES.LEFT and "left" or "right"))
+    end
+    
+    -- Velocity-based side (moving targets)
+    if data.current_speed and data.current_speed > 35 then
+        local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+        local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
+        local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
+        
+        if eye_yaw then
+            local move_yaw = math.deg(math.atan2(vy, vx))
+            local diff = angle_diff(move_yaw, eye_yaw)
+            
+            if diff > 25 and diff < 155 then
+                votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 3.0
+                table.insert(vote_reasons, "vel_right")
+            elseif diff < -25 and diff > -155 then
+                votes[SIDES.LEFT] = votes[SIDES.LEFT] + 3.0
+                table.insert(vote_reasons, "vel_left")
+            end
+        end
+    end
+    
+    -- Animation-based side
+    local body_yaw = entity.get_prop(ent, "m_flPoseParameter", CONFIG.POSE_BODY_YAW)
+    if body_yaw then
+        body_yaw = body_yaw * 360 - 180
+        if math.abs(body_yaw) > 15 then
+            if body_yaw > 0 then
+                votes[SIDES.LEFT] = votes[SIDES.LEFT] + 2.5
+                table.insert(vote_reasons, "anim_left")
+            else
+                votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 2.5
+                table.insert(vote_reasons, "anim_right")
+            end
+        end
+    end
+    
+    -- Memory-based side (past hits)
+    if #data.successful_resolves >= 2 then
+        local left_count = 0
+        local right_count = 0
+        for i = #data.successful_resolves, math.max(1, #data.successful_resolves - 5), -1 do
+            local res = data.successful_resolves[i]
+            if res.side == SIDES.LEFT then left_count = left_count + 1
+            elseif res.side == SIDES.RIGHT then right_count = right_count + 1 end
+        end
+        if left_count > right_count + 1 then
+            votes[SIDES.LEFT] = votes[SIDES.LEFT] + 2.0
+            table.insert(vote_reasons, "mem_left")
+        elseif right_count > left_count + 1 then
+            votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 2.0
+            table.insert(vote_reasons, "mem_right")
+        end
+    end
+    
+    -- === SKEET PATTERN DETECTION ===
+    local skeet_pattern, skeet_conf = detect_skeet_pattern(data)
+    if skeet_pattern and skeet_conf > 0.5 then
+        -- Skeet patterns often use specific sides
+        if data.skeet_base_angle then
+            if data.skeet_base_angle > 0 then
+                votes[SIDES.LEFT] = votes[SIDES.LEFT] + 2.0 * skeet_conf
+            else
+                votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 2.0 * skeet_conf
+            end
+        end
+        table.insert(vote_reasons, skeet_pattern)
+    end
+    
+    -- Pattern-based side
+    if pattern == "spin" and data.spin_direction then
+        -- Spin direction is opposite of real side
+        if data.spin_direction > 0 then
+            votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 2.5
+        else
+            votes[SIDES.LEFT] = votes[SIDES.LEFT] + 2.5
+        end
+        table.insert(vote_reasons, "spin_dir")
+    elseif pattern == "jitter" or pattern == "fast_jitter" then
+        -- Jitter - use peak direction
+        if data.jitter_peak_dir then
+            if data.jitter_peak_dir > 0 then
+                votes[SIDES.LEFT] = votes[SIDES.LEFT] + 1.5
+            else
+                votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 1.5
+            end
+        end
+    end
+    
+    -- Miss learning
+    if data.opposite_from_miss then
+        if data.opposite_from_miss > 0 then
+            votes[SIDES.LEFT] = votes[SIDES.LEFT] + 3.0
+            table.insert(vote_reasons, "miss_opp_left")
+        else
+            votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 3.0
+            table.insert(vote_reasons, "miss_opp_right")
+        end
+    end
+    
+    -- Freestanding detection
+    if data.is_freestanding then
+        local lp = entity.get_local_player()
+        local lx, ly = entity.get_prop(lp, "m_vecOrigin")
+        local ex, ey = entity.get_prop(ent, "m_vecOrigin")
+        local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
+        
+        if lx and ex and eye_yaw then
+            local dx = ex - lx
+            local dy = ey - ly
+            local cross = dx * math.sin(eye_yaw * PI / 180) - dy * math.cos(eye_yaw * PI / 180)
+            
+            if cross > 50 then
+                votes[SIDES.RIGHT] = votes[SIDES.RIGHT] + 2.0
+                table.insert(vote_reasons, "freestand_right")
+            elseif cross < -50 then
+                votes[SIDES.LEFT] = votes[SIDES.LEFT] + 2.0
+                table.insert(vote_reasons, "freestand_left")
+            end
+        end
+    end
+    
+    -- Determine winner
+    local best_side = SIDES.LEFT
+    local best_votes = votes[SIDES.LEFT]
+    
+    if votes[SIDES.RIGHT] > best_votes then
+        best_side = SIDES.RIGHT
+        best_votes = votes[SIDES.RIGHT]
+    end
+    
+    -- Calculate confidence based on vote difference
+    local total_votes = votes[SIDES.LEFT] + votes[SIDES.RIGHT] + votes[SIDES.CENTER]
+    local confidence = 0.35
+    if total_votes > 0 then
+        confidence = best_votes / total_votes
+    end
+    
+    -- If no clear winner, default to left
+    if best_votes < 0.5 then
+        best_side = SIDES.LEFT
+        confidence = 0.35
+    end
+    
+    data.side_votes = votes
+    data.vote_reasons = vote_reasons
+    
+    return best_side, confidence
+end
+
 -- Miss learning - predict opposite after miss
 local function analyze_miss_learning(data)
     if not data.opposite_from_miss then 
@@ -2425,180 +3272,173 @@ local function get_prediction(ent)
     local data = get_data(ent)
     local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]")
     
-    if not eye_yaw then return 60, 0.35 end
+    if not eye_yaw then return 60, 0.35, "no_eye" end
     
-    local predictions = {}
+    -- Run all advanced analyses
+    analyze_pitch(ent, data)
+    analyze_desync(ent, data)
+    analyze_lag_comp(ent, data)
+    detect_anti_override(data)
+    predict_next_angle(data)
+    
+    -- Get pattern first
+    local pattern, p_conf, p_side = recognize_pattern(data)
+    data.detected_pattern = pattern
+    
+    -- Get distance for angle selection
+    local lp = entity.get_local_player()
+    local distance = 1000
+    if lp then
+        local lx, ly, lz = entity.get_prop(lp, "m_vecOrigin")
+        local ex, ey, ez = entity.get_prop(ent, "m_vecOrigin")
+        if lx and ex then
+            distance = vec_distance(lx, ly, lz, ex, ey, ez)
+        end
+    end
+    
+    -- === DT PREDICTION (high priority - detected during enemy DT) ===
+    if data.dt_detected and data.dt_confidence > 0.6 and ui.get(ui_elements.dt_predict) then
+        -- During enemy DT, predict angle shift
+        local dt_pattern = data.dt_pattern or "standard"
+        local dt_angle = data.dt_angle_offset or 35
+        local dt_side = dt_angle > 0 and SIDES.LEFT or SIDES.RIGHT
+        
+        -- Apply DT-adjusted angle with high confidence during active DT
+        local time_since_dt = globals.realtime() - (data.dt_last_fire_time or 0)
+        local dt_weight = math.max(0, 1 - time_since_dt / 0.5)  -- Decay over 0.5s
+        
+        if dt_weight > 0.3 then
+            local final_angle = dt_angle
+            local final_conf = data.dt_confidence * dt_weight * (data.dt_shift_probability or 0.65)
+            
+            data.predicted_side = dt_side
+            data.confidence = final_conf
+            data.top_source = "dt_" .. dt_pattern
+            data.last_resolve = final_angle
+            data.selected_angle_preset = "dt_" .. dt_pattern
+            data.dt_used = true
+            
+            return final_angle, final_conf, "dt_" .. dt_pattern
+        end
+    end
     
     -- === CLOUD DATA (highest priority if available) ===
     if ui.get(ui_elements.cloud_enabled) then
         local cloud_data = cloud_resolver.get_data(ent)
-        if cloud_data and cloud_data.confidence >= CONFIG.CLOUD_MIN_CONFIDENCE then
-            local cloud_weight = CONFIG.CLOUD_WEIGHT
-            if cloud_data.reporter_count and cloud_data.reporter_count > 1 then
-                cloud_weight = cloud_weight * (1 + cloud_data.reporter_count * CLOUD_CONFIG.CLOUD_WEIGHT_MULTIPLIER)
-            end
-            table.insert(predictions, {
-                side = cloud_data.angle > 0 and SIDES.LEFT or SIDES.RIGHT,
-                conf = cloud_data.confidence,
-                weight = cloud_weight,
-                source = "cloud",
-                angle = cloud_data.angle
-            })
-            data.cloud_used = cloud_data.source == "cloud"
+        if cloud_data and cloud_data.confidence >= CLOUD_CONFIG.MIN_CONFIDENCE then
+            data.cloud_used = true
+            data.confidence = cloud_data.confidence
+            data.top_source = "cloud"
+            data.selected_angle_preset = "cloud"
+            return cloud_data.angle, cloud_data.confidence, "cloud"
         end
     end
     
-    -- === MOVING RESOLVER (very reliable when moving) ===
-    local v_side, v_conf, v_reason = analyze_velocity(ent, data)
-    if v_conf > 0.3 then
-        table.insert(predictions, {
-            side = v_side,
-            conf = v_conf,
-            weight = 2.0 * CONFIG.WEIGHT_VELOCITY,
-            source = "velocity",
-            reason = v_reason
-        })
-    end
-    
-    -- === MEMORY (based on past successful hits) ===
-    local m_side, m_conf, m_reason = analyze_memory(data)
-    if m_conf > 0.35 then
-        table.insert(predictions, {
-            side = m_side,
-            conf = m_conf,
-            weight = 2.2 * CONFIG.WEIGHT_MEMORY,
-            source = "memory",
-            reason = m_reason
-        })
-    end
-    
-    -- === ANIMATION (body yaw from pose parameters) ===
-    local a_side, a_conf, a_reason = analyze_animation(ent, data)
-    if a_conf > 0.3 then
-        table.insert(predictions, {
-            side = a_side,
-            conf = a_conf,
-            weight = 1.8 * CONFIG.WEIGHT_ANIMATION,
-            source = "animation",
-            reason = a_reason
-        })
-    end
-    
-    -- === PATTERN RECOGNITION ===
-    local pattern, p_conf, p_side = recognize_pattern(data)
-    if p_conf > 0.4 then
-        table.insert(predictions, {
-            side = p_side,
-            conf = p_conf,
-            weight = 2.0 * CONFIG.WEIGHT_PATTERN,
-            source = "pattern",
-            pattern = pattern
-        })
-    end
-    
-    -- === FREESTANDING DETECTION ===
-    local f_side, f_conf, f_reason = analyze_freestanding(ent, data)
-    if f_conf > 0.35 then
-        table.insert(predictions, {
-            side = f_side,
-            conf = f_conf,
-            weight = 1.5,
-            source = "freestanding",
-            reason = f_reason
-        })
-    end
-    
-    -- === MISS LEARNING (opposite of last miss) ===
-    local ml_side, ml_conf, ml_reason = analyze_miss_learning(data)
-    if ml_conf > 0.35 then
-        table.insert(predictions, {
-            side = ml_side,
-            conf = ml_conf,
-            weight = 2.5,  -- High weight after miss
-            source = "miss_learning",
-            reason = ml_reason
-        })
-    end
-    
-    -- === BRUTEFORCE (after consecutive misses) ===
+    -- === SMART BRUTEFORCE (after misses) ===
     if data.consecutive_misses >= 1 then
-        local bf_side, bf_conf, bf_reason = analyze_bruteforce(data)
-        if bf_conf > 0.35 then
-            table.insert(predictions, {
-                side = bf_side,
-                conf = bf_conf,
-                weight = 2.8,  -- Even higher for bruteforce
-                source = "bruteforce",
-                reason = bf_reason
-            })
+        local bf_side, bf_conf, bf_reason = smart_bruteforce(data)
+        if bf_conf > 0.5 then
+            local bf_angle = data.bf_angle or 63
+            local final_angle = bf_side * bf_angle
+            
+            -- Apply DT adjustment to bruteforce
+            if data.dt_detected and data.dt_confidence > 0.5 then
+                final_angle, _, _ = get_dt_adjusted_angle(data, final_angle, bf_side)
+            end
+            
+            data.predicted_side = bf_side
+            data.confidence = bf_conf
+            data.top_source = bf_reason
+            data.last_resolve = final_angle
+            data.selected_angle_preset = "bruteforce_" .. data.bf_stage
+            
+            return final_angle, bf_conf, bf_reason
         end
     end
     
-    -- === DT DETECTION ===
+    -- === ANTI-OVERRIDE DETECTION ===
+    if data.is_anti_override and data.anti_override_confidence > 0.5 then
+        -- Use extended angles for anti-override
+        local ao_angle = ANGLE_PRESETS.anti_override.angle
+        local ao_side = data.desync_side or SIDES.LEFT
+        local final_angle = ao_side * ao_angle
+        
+        data.predicted_side = ao_side
+        data.confidence = data.anti_override_confidence
+        data.top_source = "anti_override"
+        data.last_resolve = final_angle
+        data.selected_angle_preset = "anti_override"
+        
+        return final_angle, data.anti_override_confidence, "anti_override"
+    end
+    
+    -- === LAG EXPLOIT DETECTION ===
+    if data.lag_exploit_detected then
+        -- Reduce confidence for lag exploiters
+        data.confidence_modifier = 0.7
+    end
+    
+    -- === EXTENDED DESYNC DETECTION ===
+    if data.has_extended_desync then
+        -- Use wider angles for extended desync
+        local ext_angle = math.min(ANGLE_PRESETS.extreme.angle, 58 + data.extended_desync_amount)
+        local side, side_conf = detect_side_advanced(ent, data, pattern)
+        local final_angle = side * ext_angle
+        
+        data.predicted_side = side
+        data.confidence = side_conf * 0.9
+        data.top_source = "extended_desync"
+        data.last_resolve = final_angle
+        data.selected_angle_preset = "extended"
+        
+        return final_angle, data.confidence, "extended_desync"
+    end
+    
+    -- === DETECT SIDE using advanced voting ===
+    local side, side_conf = detect_side_advanced(ent, data, pattern)
+    
+    -- === SELECT ANGLE based on pattern and situation ===
+    local angle, angle_name = select_angle(ent, data, pattern, distance, side_conf)
+    
+    -- === APPLY ADAPTIVE LEARNING ===
+    local adaptive_adj = get_adaptive_adjustment(data, pattern)
+    angle = angle + adaptive_adj * 0.5
+    
+    -- Apply side to angle
+    local final_angle = side * angle
+    
+    -- === APPLY DT ADJUSTMENT (if DT detected but not primary prediction) ===
+    if data.dt_detected and data.dt_confidence > 0.4 and ui.get(ui_elements.dt_predict) then
+        final_angle, side, _ = get_dt_adjusted_angle(data, final_angle, side)
+        angle_name = "dt_" .. (data.dt_pattern or "standard")
+    end
+    
+    -- Calculate overall confidence
+    local final_conf = side_conf
+    if p_conf > 0 then
+        final_conf = (side_conf + p_conf) / 2
+    end
+    
+    -- Apply confidence modifier
+    if data.confidence_modifier then
+        final_conf = final_conf * data.confidence_modifier
+    end
+    
+    -- Boost confidence if DT pattern detected
     if data.dt_detected and data.dt_confidence > 0.5 then
-        table.insert(predictions, {
-            side = data.dt_angle_offset > 0 and SIDES.LEFT or SIDES.RIGHT,
-            conf = data.dt_confidence * 0.8,
-            weight = CONFIG.WEIGHT_DT,
-            source = "dt"
-        })
+        final_conf = final_conf * (1 + data.dt_confidence * 0.15)
     end
     
-    -- === CALCULATE FINAL PREDICTION ===
-    if #predictions == 0 then return 60, 0.35 end
+    final_conf = clamp(final_conf, 0.25, 0.95)
     
-    -- Sort by weight * confidence
-    table.sort(predictions, function(a, b)
-        return (a.weight * a.conf) > (b.weight * b.conf)
-    end)
-    
-    -- Calculate weighted average
-    local total_w = 0
-    local weighted_side = 0
-    local top_source = predictions[1].source
-    
-    for _, pred in ipairs(predictions) do
-        local w = pred.weight * pred.conf
-        weighted_side = weighted_side + (pred.side * w)
-        total_w = total_w + w
-    end
-    
-    local final_side = total_w > 0 and weighted_side / total_w or 0
-    local final_conf = total_w > 0 and total_w / #predictions or 0.35
-    
-    -- Determine final side
-    if final_side > 0.2 then 
-        final_side = SIDES.LEFT
-    elseif final_side < -0.2 then 
-        final_side = SIDES.RIGHT
-    else 
-        final_side = SIDES.CENTER
-    end
-    
-    -- Calculate angle based on aggression and pattern
-    local base_angle = 58
-    local aggression_mult = ui.get(ui_elements.aggression) / 5
-    
-    -- Adjust angle based on pattern
-    if pattern == "spin" then
-        base_angle = 58 + data.spin_speed * 0.3
-    elseif pattern == "fast_jitter" then
-        base_angle = 50 + (data.jitter_peak_diff or 30) * 0.5
-    elseif pattern == "jitter" then
-        base_angle = 55
-    elseif data.is_fake_duck then
-        base_angle = 45  -- Smaller angle for fake duck
-    end
-    
-    local angle = final_side * base_angle * final_conf * aggression_mult
-    angle = clamp(angle, -165, 165)
-    
-    data.predicted_side = final_side
+    -- Store prediction data
+    data.predicted_side = side
     data.confidence = final_conf
-    data.top_source = top_source
-    data.detected_pattern = pattern
+    data.top_source = pattern ~= "unknown" and pattern or "adaptive"
+    data.last_resolve = final_angle
+    data.selected_angle_preset = angle_name
     
-    return angle, final_conf, top_source
+    return final_angle, final_conf, data.top_source
 end
 
 -- Apply resolve
@@ -2610,7 +3450,194 @@ local function apply_resolve(ent, angle)
     plist_set_force_angle(ent, angle)
 end
 
--- DT detection
+-- ============== ENHANCED DOUBLE TAP PREDICTION v19.1 ==============
+
+-- Weapon fire rate data (seconds between shots)
+local WEAPON_FIRE_RATES = {
+    -- Pistols
+    ["weapon_glock"] = 0.15, ["weapon_usp_silencer"] = 0.17, ["weapon_hkp2000"] = 0.17,
+    ["weapon_p250"] = 0.15, ["weapon_fiveseven"] = 0.15, ["weapon_cz75a"] = 0.07,
+    ["weapon_tec9"] = 0.07, ["weapon_deagle"] = 0.22, ["weapon_elite"] = 0.12,
+    ["weapon_revolver"] = 0.25,
+    
+    -- SMGs
+    ["weapon_mp9"] = 0.07, ["weapon_mac10"] = 0.075, ["weapon_mp7"] = 0.08,
+    ["weapon_ump45"] = 0.09, ["weapon_p90"] = 0.07, ["weapon_bizon"] = 0.075,
+    ["weapon_mp5sd"] = 0.08, ["weapon_mag7"] = 0.55, ["weapon_xm1014"] = 0.25,
+    ["weapon_nova"] = 0.65, ["weapon_sawedoff"] = 0.55,
+    
+    -- Rifles
+    ["weapon_ak47"] = 0.10, ["weapon_m4a1"] = 0.09, ["weapon_m4a1_silencer"] = 0.09,
+    ["weapon_famas"] = 0.08, ["weapon_galilar"] = 0.09, ["weapon_sg556"] = 0.09,
+    ["weapon_aug"] = 0.08, ["weapon_m4a4"] = 0.09,
+    
+    -- Snipers
+    ["weapon_awp"] = 1.4, ["weapon_ssg08"] = 0.5, ["weapon_scar20"] = 0.10,
+    ["weapon_g3sg1"] = 0.10,
+    
+    -- Machine guns
+    ["weapon_m249"] = 0.07, ["weapon_negev"] = 0.06,
+    
+    -- Default
+    ["default"] = 0.10
+}
+
+-- DT behavior patterns for angle prediction
+local DT_PATTERNS = {
+    -- Standard DT: rapid fire, angle often shifts opposite
+    standard = {
+        angle_shift = 35,
+        side_probability = 0.65,  -- Probability of shifting to opposite side
+        time_window = 0.4,
+        min_shots = 2
+    },
+    -- Aggressive DT: very rapid fire, wider angle shifts
+    aggressive = {
+        angle_shift = 50,
+        side_probability = 0.75,
+        time_window = 0.3,
+        min_shots = 3
+    },
+    -- Defensive DT: slower, smaller angle changes
+    defensive = {
+        angle_shift = 25,
+        side_probability = 0.55,
+        time_window = 0.5,
+        min_shots = 2
+    },
+    -- Counter-strafe DT: fires while stopping
+    counter_strafe = {
+        angle_shift = 40,
+        side_probability = 0.70,
+        time_window = 0.35,
+        min_shots = 2
+    }
+}
+
+-- Get weapon fire rate
+local function get_weapon_fire_rate(weapon)
+    if not weapon then return WEAPON_FIRE_RATES.default end
+    
+    local class_name = entity.get_classname(weapon)
+    if class_name and WEAPON_FIRE_RATES[class_name] then
+        return WEAPON_FIRE_RATES[class_name]
+    end
+    
+    return WEAPON_FIRE_RATES.default
+end
+
+-- Analyze DT behavior pattern
+local function analyze_dt_pattern(data)
+    if not data.dt_shots or #data.dt_shots < 3 then
+        return "standard", 0.5
+    end
+    
+    local recent_shots = {}
+    local now = globals.realtime()
+    
+    for _, shot in ipairs(data.dt_shots) do
+        if now - shot.time < 1.0 then
+            table.insert(recent_shots, shot)
+        end
+    end
+    
+    if #recent_shots < 3 then
+        return "standard", 0.5
+    end
+    
+    -- Calculate shot timing
+    local intervals = {}
+    for i = 2, #recent_shots do
+        table.insert(intervals, recent_shots[i].time - recent_shots[i-1].time)
+    end
+    
+    local avg_interval = 0
+    for _, interval in ipairs(intervals) do
+        avg_interval = avg_interval + interval
+    end
+    avg_interval = avg_interval / #intervals
+    
+    -- Calculate angle changes during shots
+    local angle_changes = 0
+    local angle_direction = 0
+    for i = 2, #recent_shots do
+        if recent_shots[i].angle and recent_shots[i-1].angle then
+            local diff = angle_diff(recent_shots[i].angle, recent_shots[i-1].angle)
+            angle_changes = angle_changes + math.abs(diff)
+            angle_direction = angle_direction + diff
+        end
+    end
+    
+    -- Determine pattern
+    local pattern_name = "standard"
+    local confidence = 0.5
+    
+    if avg_interval < 0.08 then
+        -- Very fast shots = aggressive DT
+        pattern_name = "aggressive"
+        confidence = 0.75
+    elseif avg_interval > 0.20 then
+        -- Slower shots = defensive DT
+        pattern_name = "defensive"
+        confidence = 0.60
+    elseif angle_changes > 30 then
+        -- Significant angle changes = counter-strafe DT
+        pattern_name = "counter_strafe"
+        confidence = 0.70
+    end
+    
+    -- Store direction preference
+    data.dt_angle_direction = angle_direction > 0 and 1 or -1
+    
+    return pattern_name, confidence
+end
+
+-- Predict angle shift during DT
+local function predict_dt_angle_shift(data, pattern_name)
+    local pattern = DT_PATTERNS[pattern_name] or DT_PATTERNS.standard
+    
+    -- Get UI settings
+    local dt_pattern_mode = ui.get(ui_elements.dt_pattern_mode) or "Auto"
+    local dt_side_flip_enabled = ui.get(ui_elements.dt_side_flip)
+    
+    -- Override pattern if not Auto
+    if dt_pattern_mode ~= "Auto" then
+        pattern_name = dt_pattern_mode:lower()
+        pattern = DT_PATTERNS[pattern_name] or DT_PATTERNS.standard
+    end
+    
+    -- Get current eye yaw
+    local eye_yaw = data.angle_history and #data.angle_history > 0 
+        and data.angle_history[#data.angle_history].angle or 0
+    
+    -- Determine shift direction based on pattern
+    local shift_direction = data.dt_angle_direction or (math.random() > 0.5 and 1 or -1)
+    
+    -- If we have miss learning, use opposite direction
+    if data.opposite_from_miss then
+        shift_direction = data.opposite_from_miss > 0 and 1 or -1
+    end
+    
+    -- Apply side flip based on UI setting
+    if dt_side_flip_enabled then
+        -- Flip to opposite side during DT
+        shift_direction = -shift_direction
+    end
+    
+    -- Calculate angle shift
+    local base_shift = pattern.angle_shift
+    local aggression = ui.get(ui_elements.dt_aggression) or 15
+    local aggression_mult = 0.5 + (aggression / 30)  -- 0.5 to 1.5
+    
+    local angle_shift = base_shift * aggression_mult * shift_direction
+    
+    -- Add small randomness
+    angle_shift = angle_shift + (math.random() - 0.5) * 10
+    
+    return angle_shift, pattern.side_probability
+end
+
+-- Enhanced DT detection with behavior analysis
 local function detect_doubletap(ent, data)
     if not ui.get(ui_elements.dt_predict) then return end
     
@@ -2618,25 +3645,147 @@ local function detect_doubletap(ent, data)
     if not weapon then return end
     
     local ammo = entity.get_prop(weapon, "m_iClip1") or 0
+    local eye_yaw = entity.get_prop(ent, "m_angEyeAngles[1]") or 0
+    local sim_time = entity.get_prop(ent, "m_flSimulationTime") or 0
     
+    -- Initialize DT data if needed
+    if not data.dt_shots then data.dt_shots = {} end
+    if not data.dt_velocity_history then data.dt_velocity_history = {} end
+    
+    -- Get velocity for counter-strafe detection
+    local vx = entity.get_prop(ent, "m_vecVelocity[0]") or 0
+    local vy = entity.get_prop(ent, "m_vecVelocity[1]") or 0
+    local speed = vec_length_2d(vx, vy)
+    
+    -- Store velocity history
+    table.insert(data.dt_velocity_history, {speed = speed, time = globals.realtime()})
+    while #data.dt_velocity_history > 20 do table.remove(data.dt_velocity_history, 1) end
+    
+    -- Detect shot fired
     if data.last_ammo ~= -1 and ammo < data.last_ammo then
         local fire_time = globals.realtime()
-        table.insert(data.dt_shots, fire_time)
-        while #data.dt_shots > 10 do table.remove(data.dt_shots, 1) end
         
+        -- Store detailed shot info
+        table.insert(data.dt_shots, {
+            time = fire_time,
+            sim_time = sim_time,
+            angle = eye_yaw,
+            speed = speed,
+            ammo = ammo
+        })
+        
+        -- Limit stored shots
+        while #data.dt_shots > 15 do table.remove(data.dt_shots, 1) end
+        
+        -- Count recent shots
         local recent = 0
+        local recent_angles = {}
         for _, t in ipairs(data.dt_shots) do
-            if fire_time - t < CONFIG.DT_TIME_THRESHOLD then recent = recent + 1 end
+            if fire_time - t.time < CONFIG.DT_TIME_THRESHOLD then
+                recent = recent + 1
+                table.insert(recent_angles, t.angle)
+            end
         end
         
-        if recent >= CONFIG.DT_SHOT_THRESHOLD then
+        -- Get weapon fire rate for comparison
+        local weapon_rate = get_weapon_fire_rate(weapon)
+        local dt_threshold = weapon_rate * 1.5  -- DT is faster than normal fire rate
+        
+        -- Check for rapid fire (DT detection)
+        local is_rapid_fire = false
+        if #data.dt_shots >= 2 then
+            local last_interval = data.dt_shots[#data.dt_shots].time - data.dt_shots[#data.dt_shots - 1].time
+            if last_interval < dt_threshold then
+                is_rapid_fire = true
+            end
+        end
+        
+        if recent >= CONFIG.DT_SHOT_THRESHOLD or is_rapid_fire then
+            -- DT detected!
             data.dt_detected = true
             data.dt_confidence = math.min(recent / 5, 1.0)
-            data.dt_angle_offset = (math.random() > 0.5 and 1 or -1) * ui.get(ui_elements.dt_aggression)
+            
+            -- Analyze DT pattern
+            local pattern_name, pattern_conf = analyze_dt_pattern(data)
+            data.dt_pattern = pattern_name
+            data.dt_pattern_confidence = pattern_conf
+            
+            -- Predict angle shift
+            local angle_shift, shift_prob = predict_dt_angle_shift(data, pattern_name)
+            data.dt_angle_offset = angle_shift
+            data.dt_shift_probability = shift_prob
+            
+            -- Check for counter-strafe (speed drops during DT)
+            if #data.dt_velocity_history >= 3 then
+                local speed_trend = 0
+                for i = #data.dt_velocity_history - 2, #data.dt_velocity_history - 1 do
+                    if data.dt_velocity_history[i+1] then
+                        speed_trend = speed_trend + (data.dt_velocity_history[i].speed - data.dt_velocity_history[i+1].speed)
+                    end
+                end
+                
+                if speed_trend > 50 then
+                    -- Counter-strafing detected
+                    data.dt_counter_strafe = true
+                    data.dt_pattern = "counter_strafe"
+                else
+                    data.dt_counter_strafe = false
+                end
+            end
+            
+            -- Store DT timing for prediction
+            data.dt_last_fire_time = fire_time
+            data.dt_expected_next_shot = fire_time + weapon_rate * 0.5
+            
+            -- Log DT detection
+            if ui.get(ui_elements.dt_log) then
+                client.log(string.format("[DT] Detected! Pattern: %s | Angle shift: %.1f | Conf: %.2f", 
+                    pattern_name, angle_shift, data.dt_confidence))
+            end
+        end
+    end
+    
+    -- DT state decay
+    if data.dt_detected then
+        local time_since_dt = globals.realtime() - (data.dt_last_fire_time or 0)
+        if time_since_dt > 0.5 then
+            -- DT ended, decay confidence
+            data.dt_confidence = data.dt_confidence * 0.9
+            
+            if data.dt_confidence < 0.3 then
+                data.dt_detected = false
+                data.dt_pattern = nil
+                data.dt_angle_offset = 0
+            end
         end
     end
     
     data.last_ammo = ammo
+end
+
+-- Get DT-adjusted angle
+local function get_dt_adjusted_angle(data, base_angle, base_side)
+    if not data.dt_detected or not data.dt_confidence then
+        return base_angle, base_side, 0
+    end
+    
+    -- Calculate DT influence
+    local dt_weight = data.dt_confidence * (data.dt_shift_probability or 0.6)
+    
+    -- Blend base angle with DT prediction
+    local dt_angle_offset = data.dt_angle_offset or 0
+    local adjusted_angle = base_angle + dt_angle_offset * dt_weight
+    
+    -- Determine if we should flip side
+    local side_flip = false
+    if math.abs(dt_angle_offset) > 30 and data.dt_shift_probability > 0.65 then
+        side_flip = true
+        adjusted_angle = -adjusted_angle  -- Flip to opposite side
+    end
+    
+    local adjusted_side = side_flip and -base_side or base_side
+    
+    return adjusted_angle, adjusted_side, dt_angle_offset
 end
 
 -- Learn from miss
@@ -2780,18 +3929,22 @@ client.set_event_callback("aim_fire", function(e)
         end
     end
     
+    local angle_preset = data.selected_angle_preset or "standard"
+    local cloud_info = data.cloud_used and " [CLOUD]" or ""
+    local dt_info = data.dt_used and string.format(" [DT:%s]", data.dt_pattern or "std") or ""
+    
     -- Check if backtrack was applied
     if data.backtrack_is_valid and data.best_bt_tick then
         global_stats.backtrack_shots = global_stats.backtrack_shots + 1
         
         -- Log FIRE with backtrack info
         local bt_type = data.bt_tick_diff > 18 and " EXTENDED" or ""
-        client.log(string.format("[FIRE] T:%d | Dist:%.0f | BT:%d%s ticks | Angle:%.1f%s", 
-            ent, dist, data.bt_tick_diff or 0, bt_type, data.last_resolve or 60, data.cloud_used and " [CLOUD]" or ""))
+        client.log(string.format("[FIRE] T:%d | Dist:%.0f | BT:%d%s | Angle:%.1f (%s)%s%s", 
+            ent, dist, data.bt_tick_diff or 0, bt_type, data.last_resolve or 60, angle_preset, dt_info, cloud_info))
     else
         -- Log FIRE without backtrack
-        client.log(string.format("[FIRE] T:%d | Dist:%.0f | No BT | Angle:%.1f%s", 
-            ent, dist, data.last_resolve or 60, data.cloud_used and " [CLOUD]" or ""))
+        client.log(string.format("[FIRE] T:%d | Dist:%.0f | Angle:%.1f (%s)%s%s", 
+            ent, dist, data.last_resolve or 60, angle_preset, dt_info, cloud_info))
     end
 end)
 
@@ -2825,15 +3978,19 @@ client.set_event_callback("aim_hit", function(e)
     end
     
     -- Mark backtrack hit
-    if data.backtrack_is_valid and data.best_bt_tick then
+    if data.backtrack_is_valid and data.bt_tick_diff and data.bt_tick_diff > 0 then
         global_stats.backtrack_hits = global_stats.backtrack_hits + 1
         
-        -- Mark this tick diff as successful for pattern learning
-        for _, bt in ipairs(data.best_tick_history) do
-            if bt.tick_count == data.best_bt_tick then
-                bt.hit = true
-                break
-            end
+        -- Store successful tick diff for pattern learning
+        table.insert(data.best_tick_history, {
+            tick_diff = data.bt_tick_diff,
+            hit = true,
+            time = globals.realtime()
+        })
+        
+        -- Limit history
+        while #data.best_tick_history > 20 do
+            table.remove(data.best_tick_history, 1)
         end
     end
     
@@ -2865,15 +4022,18 @@ client.set_event_callback("aim_hit", function(e)
     end
     
     local cloud_info = data.cloud_used and " [CLOUD]" or ""
+    local dt_info = data.dt_used and string.format(" [DT:%s]", data.dt_pattern or "std") or ""
     local name = entity.get_player_name(ent) or "?"
+    local angle_preset = data.selected_angle_preset or "standard"
     
-    client.log(string.format("[HIT] %s | T:%d | %s | DMG:%d | Dist:%.0f | Streak:%d | Angle:%.1f%s%s", 
-        name, ent, hitgroup_name, damage, dist, data.consecutive_hits, data.last_resolve, bt_info, cloud_info))
+    client.log(string.format("[HIT] %s | T:%d | %s | DMG:%d | Dist:%.0f | Streak:%d | Angle:%.1f (%s)%s%s%s", 
+        name, ent, hitgroup_name, damage, dist, data.consecutive_hits, data.last_resolve, angle_preset, bt_info, dt_info, cloud_info))
     
     data.backtrack_is_valid = false
     data.best_bt_tick = 0
     data.bt_tick_diff = 0
     data.cloud_used = false
+    data.dt_used = false
 end)
 
 client.set_event_callback("aim_miss", function(e)
@@ -2943,8 +4103,16 @@ client.set_event_callback("paint", function()
     if not lp or not entity.is_alive(lp) then return end
     
     local x, y = 10, 200
-    renderer.text(x, y, 255, 255, 255, 255, "", 0, "══════ RESOLVER v19.0 ══════")
+    renderer.text(x, y, 255, 255, 255, 255, "", 0, "══════ RESOLVER v19.1 ══════")
     y = y + 12
+    
+    -- DT Status
+    if ui.get(ui_elements.dt_predict) then
+        local dt_mode = ui.get(ui_elements.dt_pattern_mode) or "Auto"
+        local dt_side_flip = ui.get(ui_elements.dt_side_flip) and "ON" or "OFF"
+        renderer.text(x, y, 255, 200, 100, 255, "", 0, string.format("DT: %s | SideFlip: %s", dt_mode, dt_side_flip))
+        y = y + 12
+    end
     
     if ui.get(ui_elements.cloud_enabled) then
         local status = cloud_state.initialized and "CONNECTED" or "CONNECTING..."
@@ -2984,7 +4152,54 @@ client.set_event_callback("round_start", function()
         data.bt_tick_diff = 0
     end
     global_stats.streak_current = 0
-    client.log("[Resolver v19.0] Round start - Cloud Ready!")
+    
+    -- Re-initialize cloud resolver to get SteamID
+    if ui.get(ui_elements.cloud_enabled) then
+        if not cloud_state.my_steam64 or tostring(cloud_state.my_steam64):find("session_") then
+            cloud_state.initialized = false
+            cloud_resolver.init()
+        end
+    end
+    
+    client.log("[Resolver v19.1] Round start - DT Prediction Ready!")
 end)
 
-client.log("[Forward HVH Resolver v19.0] Loaded!")
+-- Re-try SteamID on player spawn
+client.set_event_callback("player_spawn", function(e)
+    local lp = entity.get_local_player()
+    if not lp then return end
+    
+    -- Only for local player
+    if e.userid and client.userid_to_index then
+        local idx = client.userid_to_index(e.userid)
+        if idx == lp then
+            -- Retry getting SteamID if we don't have a real one (not session ID)
+            if not cloud_state.my_steam64 or tostring(cloud_state.my_steam64):find("session_") then
+                local steam64 = get_local_steamid()
+                if steam64 and not tostring(steam64):find("session_") then
+                    cloud_state.my_steam64 = steam64
+                    cloud_state.my_steamid = tostring(steam64)
+                    client.log("[Cloud v19.0] Got SteamID on spawn: " .. tostring(steam64))
+                end
+            end
+        end
+    end
+end)
+
+-- Also try on player_connect_full for lobby join
+client.set_event_callback("player_connect_full", function(e)
+    -- Wait a bit then try to get SteamID
+    client.delay_call(1.0, function()
+        if not cloud_state.my_steam64 or tostring(cloud_state.my_steam64):find("session_") then
+            local steam64 = get_local_steamid()
+            if steam64 then
+                cloud_state.my_steam64 = steam64
+                cloud_state.my_steamid = tostring(steam64)
+                local id_type = tostring(steam64):find("session_") and " (session)" or " (steam64)"
+                client.log("[Cloud v19.0] Got ID on connect: " .. tostring(steam64) .. id_type)
+            end
+        end
+    end)
+end)
+
+client.log("[Forward HVH Resolver v19.1] Loaded! DT Prediction Enhanced")
